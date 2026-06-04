@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pth
+trained_model/
+dataset/
+.DS_Store
+*Zone.Identifier
