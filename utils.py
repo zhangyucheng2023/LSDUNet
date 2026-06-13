@@ -1,35 +1,36 @@
 import os
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import torch
 import numpy as np
 import random
-from math import *
+from math import log10, exp
 import torch.nn.functional as F
 from skimage.metrics import structural_similarity as ssim_count
-import torch.distributed as dist
 
-device_id = "cuda:0"
+# 安全设备检测：尝试 CUDA 计算，失败则回退 CPU
+def _get_device(device_id="cuda:0"):
+    if torch.cuda.is_available():
+        try:
+            d = torch.device(device_id)
+            t = torch.zeros(2).to(d)
+            t = t + 1  # 执行实际运算，验证 kernel 可用
+            return d
+        except Exception:
+            pass
+    return torch.device("cpu")
 
-device = torch.device(device_id if torch.cuda.is_available() else "cpu")
-test_device = torch.device(device_id if torch.cuda.is_available() else "cpu")
+device = _get_device("cuda:0")
+test_device = _get_device("cuda:0")
+print(f"[Device] Using: {device}")
 
 def setup_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def rgb_to_ycbcr(input):
-    # input is mini-batch N x 3 x H x W of an RGB image
-    output = input.new(input.size())
-    output[:, 0, :, :] = input[:, 0, :, :] * 65.481 + input[:, 1, :, :] * 128.553 + input[:, 2, :, :] * 24.966 + 16
-    output[:, 1, :, :] = input[:, 0, :, :] * -37.797 + input[:, 1, :, :] * -74.203 + input[:, 2, :, :] * 112.0 + 128
-    output[:, 2, :, :] = input[:, 0, :, :] * 112.0 + input[:, 1, :, :] * -93.786 + input[:, 2, :, :] * -18.214 + 128
-    return output
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def gaussian(window_size, sigma):

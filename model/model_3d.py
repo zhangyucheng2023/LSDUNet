@@ -214,15 +214,13 @@ class DSTSpaceBlock(nn.Module):
         v_flat = v.permute(0, 1, 3, 2, 4, 5)  # [B, H, T, C', H, W]
         v_flat = v_flat.reshape(B * self.num_heads * T, self.head_dim, H, W)
 
-        # 对每个采样点做 grid_sample
-        sampled_list = []
-        for p in range(self.num_points):
-            grid_p = sample_grid[:, p, :, :, :]  # [B*H*T, H, W, 2]
-            sampled_p = F.grid_sample(v_flat, grid_p, mode='bilinear',
-                                      padding_mode='border', align_corners=True)
-            sampled_list.append(sampled_p)  # [B*H*T, C', H, W]
-
-        sampled = torch.stack(sampled_list, dim=1)  # [B*H*T, P, C', H, W]
+        # 向量化 grid_sample：合并所有采样点到 batch 维，单次调用
+        BHT, P, H_grid, W_grid, _ = sample_grid.shape
+        sample_grid_flat = sample_grid.reshape(BHT * P, H_grid, W_grid, 2)
+        v_flat_expanded = v_flat.unsqueeze(1).expand(-1, P, -1, -1, -1).reshape(BHT * P, self.head_dim, H_grid, W_grid)
+        sampled_flat = F.grid_sample(v_flat_expanded, sample_grid_flat, mode='bilinear',
+                                     padding_mode='border', align_corners=True)
+        sampled = sampled_flat.reshape(BHT, P, self.head_dim, H_grid, W_grid)  # [B*H*T, P, C', H, W]
 
         # 注意力加权聚合
         attn_flat = attn.permute(0, 1, 3, 2, 4, 5)  # [B, H, T, P, H, W]
@@ -271,8 +269,6 @@ class GRAD3D(nn.Module):
         self.conv2f = nn.Conv3d(1, dim, kernel_size=1)
         self.res = nn.Sequential(
             nn.Conv3d(dim, dim, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
-            nn.BatchNorm3d(dim),
-            nn.GELU(),
             nn.Conv3d(dim, dim, kernel_size=(1, 3, 3), padding=(0, 1, 1))
         )
 
@@ -359,23 +355,9 @@ class SModule(nn.Module):
         super().__init__()
         self.patch = patch
         self.s_weight = s_weight
-        self.res = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=5, padding=2),
-            nn.GELU(),
-            nn.Conv2d(32, 32, kernel_size=5, padding=2),
-            nn.GELU(),
-            nn.Conv2d(32, 16, kernel_size=7, padding=3),
-            nn.GELU(),
-            nn.Conv2d(16, 8, kernel_size=7, padding=3),
-            nn.GELU(),
-            nn.Conv2d(8, 1, kernel_size=7, padding=3),
-            nn.GELU()
-        )
 
     def forward(self, x):
-        x = x + self.res(x)
-        y = F.conv2d(x, self.s_weight, stride=self.patch)
-        return y
+        return F.conv2d(x, self.s_weight, stride=self.patch)
 
 
 class RModule(nn.Module):
@@ -383,18 +365,9 @@ class RModule(nn.Module):
         super().__init__()
         self.patch = patch
         self.s_weight = s_weight
-        self.res = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, 32, kernel_size=7, padding=3),
-            nn.GELU(),
-            nn.Conv2d(32, 1, kernel_size=3, padding=1)
-        )
 
     def forward(self, y):
-        x = F.conv_transpose2d(y, self.s_weight, stride=self.patch)
-        x = x + self.res(x)
-        return x
+        return F.conv_transpose2d(y, self.s_weight, stride=self.patch)
 
 
 # ═══════════════════════════════════════════════════
@@ -456,4 +429,4 @@ class LSDUNet(nn.Module):
 
         if return_intermediates:
             return x, intermediates
-        return x, x.clone()
+        return x
