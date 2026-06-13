@@ -113,9 +113,11 @@ for i = 1..8:
 |------|------|
 | 3D 体积（多帧堆叠） | 利用帧间时间冗余提升重建质量 |
 | CS 分块采样 (patch=32) | 降低参数量，压缩比可控 |
+| CS 纯线性采样（无激活） | 保证数据一致性误差的严密物理可解释性 |
 | 深度展开 8 轮 | 平衡重建精度与计算开销 |
 | 可变形空间注意力 | 触觉接触区域形状不规则，固定 grid 无法自适应 |
 | 时序门控 | 过滤无意义的帧间传感器噪声 |
+| 可学习残差权重 (0.05) | 早期退化为恒等映射，保证深度展开数值稳定性 |
 | 边缘增强分支 | 保留物体物理轮廓，抑制触觉传感器高频噪声 |
 
 ## 训练
@@ -124,25 +126,39 @@ for i = 1..8:
 python train.py
 ```
 
+默认依次训练 5 个压缩比：`[0.01, 0.04, 0.10, 0.25, 0.50]`，每个均训练 80 轮。
+
+### 数据集
+
+| 用途 | 数据集 | 说明 |
+|------|--------|------|
+| 训练集 | `dataset/toucHD/train` | ToucHD GelSight，142 条时序序列 |
+| 验证集 | `dataset/touch_and_go` | Touch and Go，140 条时序序列 |
+| 测试集 | tacquad / yuan18 / visgel | 跨域泛化评估 |
+
+输入图片为 8-bit 灰度 PNG，经 `Grayscale() → Resize(128,128) → CenterCrop(96) → ToTensor()` 转为 `[B, T, 1, H, W]` float32 张量（值域 [0, 1]）。
+
 ### 主要超参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--sensing_rate` | 0.5 | CS 压缩比 |
-| `--epochs` | 150 | 训练轮数 |
-| `--batch_size` | 8 | 批次大小 |
+| `--epochs` | 80 | 训练轮数 |
+| `--batch_size` | 8 | 批次大小（RTX 5080 上限） |
 | `--num_frames` | 4 | 3D 体积帧数 |
 | `--patch` | 32 | CS 采样分块大小 |
 | `--iter_num` | 8 | 深度展开迭代次数 |
 | `--model_dim` | 16 | 特征维度 |
-| `--lr` | 8e-5 | 初始学习率 |
+| `--lr` | 1e-4 | 初始学习率 |
+| `--flr` | 1e-6 | 最终学习率（CosineAnnealing） |
+| `--train_data` | `dataset/toucHD/train` | 训练集路径 |
+| `--val_dir` | `dataset/touch_and_go` | 验证集路径 |
 
 ### 损失函数与优化
 
 - **损失函数**: MSE (均方误差)
 - **优化器**: Adam + CosineAnnealingLR 调度
-- **混合精度**: AMP (`torch.cuda.amp`) 加速训练
-- **评估指标**: PSNR (峰值信噪比) + SSIM (结构相似性)
+- **混合精度**: AMP (`torch.cuda.amp`) 在 GPU 环境自动启用，CPU 回退标准训练
+- **评估指标**: PSNR + SSIM + LPIPS + Edge-PSNR + ROI-PSNR
 
 ## 评估
 
@@ -150,14 +166,19 @@ python train.py
 python eval.py
 ```
 
-支持两种评估模式：
+对训练好的模型在测试集上评估，输出 PSNR、SSIM、LPIPS、Edge-PSNR、ROI-PSNR 及推理效率（FPS、FLOPs）。
 
-1. **自参考重建**: 触觉图像 → 压缩采样 → 重建，对比原图 PSNR/SSIM
-2. **触觉→高度图**: 触觉图像重建结果与地面真值高度图对比
+支持多数据集评估：tacquad、yuan18、visgel（跨域泛化测试）以及 touch_and_go 等。
+
+## 硬件兼容性
+
+- **自动设备检测**: 运行时通过实际 CUDA 运算测试验证 GPU 可用性，失败自动回退 CPU
+- **RTX 5080 (Blackwell, sm_120)**: 需 PyTorch nightly + CUDA 13.0+
+- **CPU 训练**: 无 GPU 时自动禁用 AMP，使用标准反向传播
 
 ## 依赖
 
-- PyTorch
+- PyTorch >= 2.5（RTX 5080 需 nightly + CUDA 13.0+）
 - torchvision
 - scikit-image
 - tqdm
