@@ -162,6 +162,8 @@ python train.py
 
 ## 评估
 
+### 标准评估
+
 ```bash
 python eval.py
 ```
@@ -169,6 +171,34 @@ python eval.py
 对训练好的模型在测试集上评估，输出 PSNR、SSIM、LPIPS、Edge-PSNR、ROI-PSNR 及推理效率（FPS、FLOPs）。
 
 支持多数据集评估：tacquad、yuan18、visgel（跨域泛化测试）以及 touch_and_go 等。
+
+### 动态视频抗噪评估
+
+```bash
+# 仅 ConvTokenizer3D（默认）
+python eval_noise.py
+
+# 完整消融对比（ConvTokenizer3D vs LinearTokenizer）
+python eval_noise.py --full
+
+# 仅消融模型
+python eval_noise.py --ablation
+
+# 单压缩比
+python eval_noise.py --single 0.10
+```
+
+向连续触觉测试序列注入多等级高斯白噪声（σ ∈ [0, 0.20]），评估重建稳定性：
+
+| 噪声等级 | σ=0 | σ=0.02 | σ=0.05 | σ=0.10 | σ=0.15 | σ=0.20 |
+|----------|-----|--------|--------|--------|--------|--------|
+
+输出指标（逐帧 clean vs noisy）：
+- **PSNR_drop** = PSNR_clean − PSNR_noisy（越小 = 抗噪越强）
+- **Edge_PSNR_drop**: 边缘保留对噪声的鲁棒性
+- **Temporal_PSNR_drop**: 时序一致性对噪声的鲁棒性
+
+消融对照 `LinearTokenizer`（纯 1×1×1 卷积投影，无边缘分支），证明 ConvTokenizer3D 的 Sobel-style 空间边缘 + 帧间差分算子提供了**物理抗噪先验**。
 
 ## 硬件兼容性
 
