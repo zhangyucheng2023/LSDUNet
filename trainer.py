@@ -94,7 +94,7 @@ def valid_3d(val_loader, model, device):
             B, T, C, H, W = inputs.shape  # [B, T, 1, H, W], already [0,1] from ToTensor
             y_ch = inputs
             outputs = model(y_ch)
-            pred = outputs[0]
+            pred = outputs
             target = y_ch
             mse = F.mse_loss(pred, target)
             total_mse += mse.item() * pred.numel()
