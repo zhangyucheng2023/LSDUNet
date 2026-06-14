@@ -147,7 +147,7 @@ if __name__ == '__main__':
     parser.add_argument('--flr', '--final_learning_rate', default=1e-6, type=float, help='final learning rate')
     parser.add_argument('--save_dir', help='trained models', default='trained_model', type=str)
     parser.add_argument('--iter_num', type=int, default=8, help='3D iteration count')
-    parser.add_argument('--model_dim', type=int, default=16, help='feature dimension')
+    parser.add_argument('--model_dim', type=int, default=32, help='feature dimension')
     parser.add_argument('--train_data', type=str, default='dataset/toucHD/train', help='train dataset path (ToucHD gelsight, 142 seqs)')
     parser.add_argument('--val_dir', type=str, default='dataset/touch_and_go', help='val dataset path (Touch and Go, 142 seqs)')
     parser.add_argument('--train_split', type=str, default='', help='frame-level split file for train filtering')
