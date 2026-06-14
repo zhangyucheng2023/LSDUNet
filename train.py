@@ -152,9 +152,11 @@ if __name__ == '__main__':
     parser.add_argument('--val_dir', type=str, default='dataset/touch_and_go', help='val dataset path (Touch and Go, 142 seqs)')
     parser.add_argument('--train_split', type=str, default='', help='frame-level split file for train filtering')
     parser.add_argument('--val_split', type=str, default='', help='frame-level split file for val filtering')
+    parser.add_argument('--ratios', type=str, default='0.01,0.04,0.10,0.25,0.50',
+                        help='CS sensing rates, comma-separated (default: 0.01,0.04,0.10,0.25,0.50)')
     args = parser.parse_args()
 
-    cs_ratios = [0.01, 0.04, 0.10, 0.25, 0.50]
+    cs_ratios = [float(x.strip()) for x in args.ratios.split(',')]
     total_start = time.time()
 
     # 汇总日志
