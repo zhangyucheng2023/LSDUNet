@@ -244,9 +244,9 @@ class DSTLayer(nn.Module):
         self.dst_space = DSTSpaceBlock(dim, num_heads, num_offset_points)
         self.ffn = FFN3D(dim, hidden=4)
         # 可学习残差权重（稳定训练）
-        self.w_time = nn.Parameter(0.05 * torch.ones(1, dim, 1, 1, 1))
-        self.w_space = nn.Parameter(0.05 * torch.ones(1, dim, 1, 1, 1))
-        self.w_ffn = nn.Parameter(0.05 * torch.ones(1, dim, 1, 1, 1))
+        self.w_time = nn.Parameter(0.5 * torch.ones(1, dim, 1, 1, 1))
+        self.w_space = nn.Parameter(0.5 * torch.ones(1, dim, 1, 1, 1))
+        self.w_ffn = nn.Parameter(0.5 * torch.ones(1, dim, 1, 1, 1))
 
     def forward(self, x):
         # 时间可变形注意力 — 捕捉滑动轨迹
@@ -269,6 +269,7 @@ class GRAD3D(nn.Module):
         self.conv2f = nn.Conv3d(1, dim, kernel_size=1)
         self.res = nn.Sequential(
             nn.Conv3d(dim, dim, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
+            nn.GELU(),
             nn.Conv3d(dim, dim, kernel_size=(1, 3, 3), padding=(0, 1, 1))
         )
 
@@ -301,7 +302,15 @@ class DENO3D(nn.Module):
             nn.Conv3d(dim, dim, kernel_size=(1, 2, 2), stride=(1, 2, 2)),
             nn.GELU(),
         )
-        self.mix = nn.Sequential(
+        self.mix1 = nn.Sequential(
+            nn.Conv3d(dim, dim, kernel_size=(1, 5, 5), padding=(0, 2, 2)),
+            nn.GELU(),
+        )
+        self.mix2 = nn.Sequential(
+            nn.Conv3d(dim, dim, kernel_size=(1, 5, 5), padding=(0, 2, 2)),
+            nn.GELU(),
+        )
+        self.mix3 = nn.Sequential(
             nn.Conv3d(dim, dim, kernel_size=(1, 5, 5), padding=(0, 2, 2)),
             nn.GELU(),
         )
@@ -329,9 +338,9 @@ class DENO3D(nn.Module):
         x_down3 = self.down3(x_down2) + (x_as[0] if x_as else 0)
 
         x_up0 = x_down3
-        x_up1 = self.mix(self._up2(x_up0) + x_down2)
-        x_up2 = self.mix(self._up2(x_up1) + x_down1)
-        x_up3 = self.mix(self._up2(x_up2) + x_down0)
+        x_up1 = self.mix1(self._up2(x_up0) + x_down2)
+        x_up2 = self.mix2(self._up2(x_up1) + x_down1)
+        x_up3 = self.mix3(self._up2(x_up2) + x_down0)
 
         x_out = x_up3 + self.res(x_up3)
         x = self.conv_out(torch.cat([x, x_out], dim=1))
