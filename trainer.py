@@ -42,7 +42,7 @@ def compute_lpips_batch(pred, target):
         return _lpips_model(pred_t, target_t).mean().item()
 
 
-def train_3d(train_loader, model, criterion, optimizer, device):
+def train_3d(train_loader, model, criterion, optimizer, device, grad_clip=1.0):
     model.train()
     sum_loss = 0
     use_amp = (device.type == 'cuda')
@@ -60,12 +60,17 @@ def train_3d(train_loader, model, criterion, optimizer, device):
                 outputs = model(y_ch)
                 loss = criterion(outputs, y_ch)
             scaler.scale(loss).backward()
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
             outputs = model(y_ch)
             loss = criterion(outputs, y_ch)
             loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
         sum_loss += loss.item()

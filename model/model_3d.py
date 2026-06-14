@@ -383,12 +383,13 @@ class RModule(nn.Module):
 # LSDUNet 主模型
 # ═══════════════════════════════════════════════════
 class LSDUNet(nn.Module):
-    def __init__(self, ratio, iter_num=8, model_dim=16, patch=32):
+    def __init__(self, ratio, iter_num=8, model_dim=64, patch=32, num_heads=8):
         super().__init__()
 
         self.model_dim = model_dim
         self.iter_num = iter_num
         self.patch = patch
+        self.num_heads = num_heads
         self.full_dim = patch ** 2
         self.cs_dim = int(ratio * self.full_dim)
 
@@ -405,7 +406,7 @@ class LSDUNet(nn.Module):
 
         # GDB 梯度去噪 + DST 混合注意力
         self.gdb = nn.ModuleList([GDB3D(model_dim) for _ in range(self.iter_num)])
-        self.dst = nn.ModuleList([DSTLayer(model_dim) for _ in range(self.iter_num)])
+        self.dst = nn.ModuleList([DSTLayer(model_dim, num_heads=num_heads) for _ in range(self.iter_num)])
 
     def forward(self, x, return_intermediates=False):
         # x: [B, T, 1, H, W]

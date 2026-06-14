@@ -35,10 +35,19 @@ def main(cs_ratio):
         os.mkdir(model_dir)
 
     model = LSDUNet(ratio=cs_ratio, iter_num=args.iter_num,
-                     model_dim=args.model_dim, patch=args.patch).to(device)
+                     model_dim=args.model_dim, patch=args.patch,
+                     num_heads=args.num_heads).to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs + 1, eta_min=args.flr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    main_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warm_epochs + 1,
+                                       eta_min=args.flr)
+
+    def warmup_lambda(epoch):
+        if epoch < args.warm_epochs:
+            return float(epoch + 1) / max(args.warm_epochs, 1)
+        return 1.0
+
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_lambda)
 
     train_loader, val_loader = data_loader_3d(
         args, train_dir=args.train_data, val_dir=args.val_dir,
@@ -73,9 +82,13 @@ def main(cs_ratio):
         start_ = time.time()
         current_lr = optimizer.param_groups[0]['lr']
         print('current lr {:.5e}'.format(current_lr))
-        loss = train_3d(train_loader, model, criterion, optimizer, device)
+        loss = train_3d(train_loader, model, criterion, optimizer, device,
+                        grad_clip=args.grad_clip)
 
-        scheduler.step()
+        if epoch < args.warm_epochs:
+            warmup_scheduler.step()
+        else:
+            main_scheduler.step()
         print_data = "[%02d/%02d] Train Loss: %.5f" % (epoch, args.epochs, loss)
         print(print_data)
         writer.add_scalar('Loss/train', loss, epoch)
@@ -136,18 +149,21 @@ def main(cs_ratio):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='LSDUNet', help='model name')
-    parser.add_argument('--warm_epochs', default=1, type=int, help='number of epochs to warm up')
-    parser.add_argument('--epochs', default=80, type=int, help='number of total epochs to run')
-    parser.add_argument('-b', '--batch_size', default=8, type=int, help='mini-batch size')
+    parser.add_argument('--warm_epochs', default=5, type=int, help='linear warmup epochs')
+    parser.add_argument('--epochs', default=150, type=int, help='number of total epochs to run')
+    parser.add_argument('-b', '--batch_size', default=32, type=int, help='mini-batch size')
     parser.add_argument('--image-size', default=16 * 6, type=int, metavar='N', help='(default: 96)')
-    parser.add_argument('--num_frames', default=4, type=int, help='frames per 3D volume')
+    parser.add_argument('--num_frames', default=8, type=int, help='frames per 3D volume')
     parser.add_argument('--max_frames_per_seq', default=200, type=int, help='max frames per sequence (0=unlimited)')
     parser.add_argument('--patch', default=32, type=int, help='CS sampling patch size')
-    parser.add_argument('--lr', '--learning_rate', default=1e-4, type=float, help='initial learning rate')
+    parser.add_argument('--lr', '--learning_rate', default=2e-4, type=float, help='initial learning rate')
     parser.add_argument('--flr', '--final_learning_rate', default=1e-6, type=float, help='final learning rate')
+    parser.add_argument('--wd', '--weight_decay', default=0.05, type=float, help='AdamW weight decay')
+    parser.add_argument('--grad_clip', default=1.0, type=float, help='gradient clipping norm')
     parser.add_argument('--save_dir', help='trained models', default='trained_model', type=str)
     parser.add_argument('--iter_num', type=int, default=8, help='3D iteration count')
-    parser.add_argument('--model_dim', type=int, default=32, help='feature dimension')
+    parser.add_argument('--model_dim', type=int, default=64, help='feature dimension')
+    parser.add_argument('--num_heads', type=int, default=8, help='DST attention heads')
     parser.add_argument('--train_data', type=str, default='dataset/toucHD/train', help='train dataset path (ToucHD gelsight, 142 seqs)')
     parser.add_argument('--val_dir', type=str, default='dataset/touch_and_go', help='val dataset path (Touch and Go, 142 seqs)')
     parser.add_argument('--train_split', type=str, default='', help='frame-level split file for train filtering')
