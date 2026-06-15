@@ -82,7 +82,7 @@ def main(cs_ratio):
     log_path = os.path.join(model_dir, 'train_log.csv')
     log_file = open(log_path, 'w', newline='')
     csv_writer = csv.writer(log_file)
-    csv_writer.writerow(['epoch', 'train_loss', 'val_psnr', 'val_ssim', 'val_lpips',
+    csv_writer.writerow(['epoch', 'train_loss', 'loss_type', 'val_psnr', 'val_ssim', 'val_lpips',
                          'val_edge_psnr', 'val_roi_psnr', 'val_roi_ssim',
                          'lr', 'best_psnr', 'time_s'])
 
@@ -133,7 +133,8 @@ def main(cs_ratio):
         print('Running time: {:.2f} seconds'.format(elapsed))
         print()
 
-        csv_writer.writerow([epoch, f'{loss:.6f}', f'{val_psnr:.4f}',
+        csv_writer.writerow([epoch, f'{loss:.6f}', 'NLL' if use_nll else 'MSE',
+                             f'{val_psnr:.4f}',
                              f'{val_ssim:.6f}',
                              f'{val_lpips:.6f}' if val_lpips is not None else 'N/A',
                              f'{val_edge_psnr:.4f}', f'{val_roi_psnr:.4f}',
