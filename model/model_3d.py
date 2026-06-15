@@ -238,17 +238,19 @@ class DSTSpaceBlock(nn.Module):
 
 class DSTLayer(nn.Module):
     """
-    DST 混合注意力层：时间块 → 空间块 → FFN
+    DST 混合注意力层：时间块 → 空间块 → 长程时序 → FFN
     替换原架构的 CATrans3D + WLTrans3D
     """
     def __init__(self, dim, num_heads=4, num_offset_points=9):
         super().__init__()
         self.dst_time = DSTTimeBlock(dim, num_heads)
         self.dst_space = DSTSpaceBlock(dim, num_heads, num_offset_points)
+        self.lrta = LongRangeTemporalAttention(dim, num_queries=4, num_heads=num_heads)
         self.ffn = FFN3D(dim, hidden=4)
         # 可学习残差权重（稳定训练）
         self.w_time = nn.Parameter(0.5 * torch.ones(1, dim, 1, 1, 1))
         self.w_space = nn.Parameter(0.5 * torch.ones(1, dim, 1, 1, 1))
+        self.w_lrta = nn.Parameter(0.1 * torch.ones(1, dim, 1, 1, 1))
         self.w_ffn = nn.Parameter(0.5 * torch.ones(1, dim, 1, 1, 1))
 
     def forward(self, x):
@@ -256,6 +258,8 @@ class DSTLayer(nn.Module):
         x = self.w_time * self.dst_time(x) + x
         # 空间可变形注意力 — 重构压力分布
         x = self.w_space * self.dst_space(x) + x
+        # 长程时序注意力 — 全局时序依赖
+        x = self.w_lrta * self.lrta(x) + x
         # FFN
         x = self.w_ffn * self.ffn(x) + x
         return x
@@ -362,14 +366,41 @@ class GDB3D(nn.Module):
         return x, x_as_new
 
 
-class SModule(nn.Module):
-    def __init__(self, patch, s_weight):
+# ═══════════════════════════════════════════════════
+# D. 自适应采样矩阵 — 内容感知的重要性分配
+# ═══════════════════════════════════════════════════
+class AdaptiveSModule(nn.Module):
+    """
+    内容自适应采样：根据输入信号的能量分布，动态分配测量预算。
+    高能量区域（接触面）获得更多有效测量，低能量区域（背景）分配更少。
+    等效于非均匀采样率的 variable-rate CS。
+    """
+    def __init__(self, patch, cs_dim):
         super().__init__()
         self.patch = patch
-        self.s_weight = s_weight
+        self.cs_dim = cs_dim
+
+        # 基础采样矩阵
+        self.s_weight = nn.Parameter(
+            kaiming_normal_(torch.Tensor(cs_dim, 1, patch, patch))
+        )
+
+        # 轻量重要性预测器：逐 patch 估计信号能量
+        self.importance_net = nn.Sequential(
+            nn.Conv2d(1, 8, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(8, 8, 3, padding=1, stride=patch),
+            nn.GELU(),
+            nn.Conv2d(8, cs_dim, 1),
+            nn.Sigmoid(),
+        )
 
     def forward(self, x):
-        return F.conv2d(x, self.s_weight, stride=self.patch)
+        # x: [B, 1, H, W]
+        y = F.conv2d(x, self.s_weight, stride=self.patch)  # [B, cs_dim, H/patch, W/patch]
+        imp = self.importance_net(x)  # [B, cs_dim, H/patch, W/patch]
+        y = y * imp  # 重要性加权：高能量区域测量值被放大
+        return y
 
 
 class RModule(nn.Module):
@@ -380,6 +411,67 @@ class RModule(nn.Module):
 
     def forward(self, y):
         return F.conv_transpose2d(y, self.s_weight, stride=self.patch)
+
+
+# ═══════════════════════════════════════════════════
+# F. 长程时序依赖 — 可学习查询跨注意力
+# ═══════════════════════════════════════════════════
+class LongRangeTemporalAttention(nn.Module):
+    """
+    长程时序依赖建模：用一组可学习时序查询 (Q) 跨注意力到所有 T 帧，
+    捕捉超出 8 帧局部窗口的全局时序演化模式。
+    复杂度 O(Q×T)，Q=4 个查询覆盖不同时间尺度（短/中/长/全局）。
+    """
+    def __init__(self, dim, num_queries=4, num_heads=4):
+        super().__init__()
+        self.dim = dim
+        self.num_queries = num_queries
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.norm = LayerNorm3D(dim)
+
+        # 可学习时序查询 — 每个查询捕获不同时间尺度模式
+        self.temporal_queries = nn.Parameter(
+            torch.randn(num_queries, dim) * 0.02
+        )
+
+        self.q_proj = nn.Linear(dim, dim)
+        self.kv_proj = nn.Conv3d(dim, dim * 2, 1)
+        self.proj = nn.Conv3d(dim, dim, 1)
+
+        # 可学习残差权重（初始小值，稳定训练）
+        self.w_lr = nn.Parameter(0.1 * torch.ones(1, dim, 1, 1, 1))
+
+    def forward(self, x):
+        B, C, T, H, W = x.shape
+        x_norm = self.norm(x)
+
+        # 空间池化 → 时序特征 [B, T, C]
+        x_pool = x_norm.mean(dim=[-2, -1]).permute(0, 2, 1)
+
+        # 可学习查询跨注意力
+        queries = self.temporal_queries.unsqueeze(0).expand(B, -1, -1)  # [B, Q, C]
+        q = self.q_proj(queries).view(B, self.num_queries, self.num_heads, self.head_dim)
+        q = q.permute(0, 2, 1, 3)  # [B, H, Q, D]
+
+        kv = self.kv_proj(x_norm).mean(dim=[-2, -1])  # [B, 2C, T]
+        k, v = kv.chunk(2, dim=1)
+        k = k.permute(0, 2, 1).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, H, Q, T]
+        attn = F.softmax(attn, dim=-1)
+        out = attn @ v  # [B, H, Q, D]
+        out = out.permute(0, 2, 1, 3).reshape(B, self.num_queries, C)  # [B, Q, C]
+
+        # 聚合查询结果 → 广播回时空维度
+        out = out.mean(dim=1).unsqueeze(2).unsqueeze(3).unsqueeze(4)  # [B, C, 1, 1, 1]
+        out = out.expand(-1, -1, T, H, W)
+        out = self.proj(out)
+
+        return out
 
 
 # ═══════════════════════════════════════════════════
@@ -396,27 +488,27 @@ class LSDUNet(nn.Module):
         self.full_dim = patch ** 2
         self.cs_dim = int(ratio * self.full_dim)
 
-        self.s_weight = nn.Parameter(
-            kaiming_normal_(torch.Tensor(self.cs_dim, 1, self.patch, self.patch))
-        )
-        self.S = SModule(self.patch, self.s_weight)
-        self.R = RModule(self.patch, self.s_weight)
+        # ── D. 自适应采样矩阵：内容感知的重要性加权 ──
+        self.adaptive_s = AdaptiveSModule(self.patch, self.cs_dim)
+        self.R = RModule(self.patch, self.adaptive_s.s_weight)
 
         # ── 替换：ConvTokenizer3D 替代原 proj_in ──
         self.tokenizer = ConvTokenizer3D(in_ch=1, dim=self.model_dim)
 
-        self.proj_out = nn.Conv3d(self.model_dim, 1, kernel_size=1)
+        # ── H. 不确定性量化：均值头 + 方差头 ──
+        self.proj_out = nn.Conv3d(self.model_dim, 1, kernel_size=1)       # 均值 μ
+        self.proj_var = nn.Conv3d(self.model_dim, 1, kernel_size=1)       # 对数方差 log σ²
 
-        # GDB 梯度去噪 + DST 混合注意力
+        # GDB 梯度去噪 + DST 混合注意力（含长程时序）
         self.gdb = nn.ModuleList([GDB3D(model_dim) for _ in range(self.iter_num)])
         self.dst = nn.ModuleList([DSTLayer(model_dim, num_heads=num_heads) for _ in range(self.iter_num)])
 
-    def forward(self, x, return_intermediates=False):
+    def forward(self, x, return_intermediates=False, return_uncertainty=False):
         # x: [B, T, 1, H, W]
         B, T, _, H, W = x.shape
         x_flat = x.view(B * T, 1, H, W)
 
-        y = self.S(x_flat)
+        y = self.adaptive_s(x_flat)   # 自适应采样
         x_r = self.R(y)
 
         # 重塑为 3D 格式 [B, 1, T, H, W]
@@ -425,11 +517,11 @@ class LSDUNet(nn.Module):
         # ── ConvTokenizer: 浅层3D卷积提取边缘+纹理Token ──
         x = self.tokenizer(x_r)
 
-        # ── 8轮迭代展开: GDB(梯度优化) + DST(时空注意力) ──
+        # ── 8轮迭代展开: GDB(梯度优化) + DST(时空注意力+长程时序) ──
         x_as = None
         intermediates = []  # 中间结果列表（用于 rank 追踪）
         for i in range(self.iter_num):
-            x, x_as = self.gdb[i](x, y, self.S, self.R, x_as)
+            x, x_as = self.gdb[i](x, y, self.adaptive_s, self.R, x_as)
             x = self.dst[i](x)
             if return_intermediates:
                 # 投影到图像空间获取中间重建结果
@@ -437,9 +529,18 @@ class LSDUNet(nn.Module):
                 x_img = x_proj.permute(0, 2, 1, 3, 4)  # [B, T, 1, H, W]
                 intermediates.append(x_img)
 
-        x = self.proj_out(x)
-        x = x.permute(0, 2, 1, 3, 4)
+        # 均值预测
+        x_mean = self.proj_out(x)
+        x_mean = x_mean.permute(0, 2, 1, 3, 4)  # [B, T, 1, H, W]
+
+        if return_uncertainty:
+            # 对数方差预测（取负值确保数值稳定）→ 不确定性 heatmap
+            log_var = self.proj_var(x)
+            log_var = log_var.permute(0, 2, 1, 3, 4)  # [B, T, 1, H, W]
+            if return_intermediates:
+                return x_mean, log_var, intermediates
+            return x_mean, log_var
 
         if return_intermediates:
-            return x, intermediates
-        return x
+            return x_mean, intermediates
+        return x_mean

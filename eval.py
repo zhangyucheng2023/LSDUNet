@@ -30,7 +30,7 @@ def load_3d_model(cs_ratio, checkpoint_path, iter_num=8, model_dim=16, patch=32,
                            model_dim=model_dim, patch=patch,
                            num_heads=num_heads).to(device)
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        model_3d.load_state_dict(checkpoint, strict=True)
+        model_3d.load_state_dict(checkpoint, strict=False)
         model_3d.eval()
         old_rate_3d = cs_ratio
     return model_3d, device

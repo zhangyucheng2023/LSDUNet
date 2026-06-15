@@ -17,8 +17,16 @@ import time
 warnings.filterwarnings("ignore")
 
 
-def loss_fun(X, Y):
-    return F.mse_loss(X, Y)
+def loss_fun(mean, target, log_var=None):
+    """
+    NLL (Negative Log-Likelihood) loss with heteroscedastic uncertainty.
+    当 log_var 为 None 时退化为标准 MSE。
+    """
+    if log_var is not None:
+        precision = torch.exp(-log_var)
+        loss = 0.5 * (log_var + precision * (mean - target) ** 2)
+        return loss.mean()
+    return F.mse_loss(mean, target)
 
 
 def count_parameters(model):
@@ -83,7 +91,7 @@ def main(cs_ratio):
         current_lr = optimizer.param_groups[0]['lr']
         print('current lr {:.5e}'.format(current_lr))
         loss = train_3d(train_loader, model, criterion, optimizer, device,
-                        grad_clip=args.grad_clip)
+                        grad_clip=args.grad_clip, use_nll=True)
 
         if epoch < args.warm_epochs:
             warmup_scheduler.step()
