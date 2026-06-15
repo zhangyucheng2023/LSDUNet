@@ -245,13 +245,13 @@ class DSTLayer(nn.Module):
         super().__init__()
         self.dst_time = DSTTimeBlock(dim, num_heads)
         self.dst_space = DSTSpaceBlock(dim, num_heads, num_offset_points)
-        self.lrta = LongRangeTemporalAttention(dim, num_queries=4, num_heads=num_heads)
+        self.lrta = LongRangeTemporalAttention(dim, num_queries=3, num_heads=num_heads)
         self.ffn = FFN3D(dim, hidden=4)
-        # 可学习残差权重（稳定训练）
-        self.w_time = nn.Parameter(0.5 * torch.ones(1, dim, 1, 1, 1))
-        self.w_space = nn.Parameter(0.5 * torch.ones(1, dim, 1, 1, 1))
-        self.w_lrta = nn.Parameter(0.1 * torch.ones(1, dim, 1, 1, 1))
-        self.w_ffn = nn.Parameter(0.5 * torch.ones(1, dim, 1, 1, 1))
+        # LayerScale: 可学习逐通道残差权重，初始化为极小值（Touvron et al., ICCV 2021）
+        self.w_time = nn.Parameter(1e-5 * torch.ones(1, dim, 1, 1, 1))
+        self.w_space = nn.Parameter(1e-5 * torch.ones(1, dim, 1, 1, 1))
+        self.w_lrta = nn.Parameter(1e-5 * torch.ones(1, dim, 1, 1, 1))
+        self.w_ffn = nn.Parameter(1e-5 * torch.ones(1, dim, 1, 1, 1))
 
     def forward(self, x):
         # 时间可变形注意力 — 捕捉滑动轨迹
@@ -420,9 +420,9 @@ class LongRangeTemporalAttention(nn.Module):
     """
     长程时序依赖建模：用一组可学习时序查询 (Q) 跨注意力到所有 T 帧，
     捕捉超出 8 帧局部窗口的全局时序演化模式。
-    复杂度 O(Q×T)，Q=4 个查询覆盖不同时间尺度（短/中/长/全局）。
+    复杂度 O(Q×T)，Q=3 个查询覆盖不同时间尺度（快划/慢划/全局）。
     """
-    def __init__(self, dim, num_queries=4, num_heads=4):
+    def __init__(self, dim, num_queries=3, num_heads=4):
         super().__init__()
         self.dim = dim
         self.num_queries = num_queries
@@ -432,7 +432,7 @@ class LongRangeTemporalAttention(nn.Module):
 
         self.norm = LayerNorm3D(dim)
 
-        # 可学习时序查询 — 每个查询捕获不同时间尺度模式
+        # 可学习时序查询 — 快划/慢划/全局三个时间尺度
         self.temporal_queries = nn.Parameter(
             torch.randn(num_queries, dim) * 0.02
         )
@@ -441,8 +441,8 @@ class LongRangeTemporalAttention(nn.Module):
         self.kv_proj = nn.Conv3d(dim, dim * 2, 1)
         self.proj = nn.Conv3d(dim, dim, 1)
 
-        # 可学习残差权重（初始小值，稳定训练）
-        self.w_lr = nn.Parameter(0.1 * torch.ones(1, dim, 1, 1, 1))
+        # LayerScale: 可学习逐通道残差权重（Touvron et al., ICCV 2021）
+        self.w_lr = nn.Parameter(1e-5 * torch.ones(1, dim, 1, 1, 1))
 
     def forward(self, x):
         B, C, T, H, W = x.shape

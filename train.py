@@ -90,8 +90,9 @@ def main(cs_ratio):
         start_ = time.time()
         current_lr = optimizer.param_groups[0]['lr']
         print('current lr {:.5e}'.format(current_lr))
+        use_nll = (epoch > args.nll_warmup)
         loss = train_3d(train_loader, model, criterion, optimizer, device,
-                        grad_clip=args.grad_clip, use_nll=True)
+                        grad_clip=args.grad_clip, use_nll=use_nll)
 
         if epoch < args.warm_epochs:
             warmup_scheduler.step()
@@ -168,6 +169,7 @@ if __name__ == '__main__':
     parser.add_argument('--flr', '--final_learning_rate', default=1e-6, type=float, help='final learning rate')
     parser.add_argument('--wd', '--weight_decay', default=0.05, type=float, help='AdamW weight decay')
     parser.add_argument('--grad_clip', default=1.0, type=float, help='gradient clipping norm')
+    parser.add_argument('--nll_warmup', default=10, type=int, help='epochs to warm up mean head with MSE before NLL')
     parser.add_argument('--save_dir', help='trained models', default='trained_model', type=str)
     parser.add_argument('--iter_num', type=int, default=8, help='3D iteration count')
     parser.add_argument('--model_dim', type=int, default=64, help='feature dimension')

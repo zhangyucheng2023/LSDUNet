@@ -59,6 +59,7 @@ def train_3d(train_loader, model, criterion, optimizer, device, grad_clip=1.0, u
             with autocast(device.type):
                 if use_nll:
                     mean, log_var = model(y_ch, return_uncertainty=True)
+                    log_var = torch.clamp(log_var, min=-10, max=10)
                     loss = criterion(mean, y_ch, log_var)
                 else:
                     outputs = model(y_ch)
