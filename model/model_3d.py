@@ -121,12 +121,14 @@ class DSTTimeBlock(nn.Module):
         self.head_dim = dim // num_heads
         self.norm = LayerNorm3D(dim)
 
-        # 多尺度时间卷积核：小核捕捉快速运动，大核捕捉慢速滑动
+        # 三尺度时间卷积核：小核抓快速运动，中核抓慢速滑动，大核抓整体趋势
         self.tconv_small = nn.Conv3d(dim, dim, kernel_size=(3, 1, 1),
                                      padding=(1, 0, 0), groups=dim)
-        self.tconv_large = nn.Conv3d(dim, dim, kernel_size=(5, 1, 1),
-                                     padding=(2, 0, 0), groups=dim)
-        self.tconv_fuse = nn.Conv3d(dim * 2, dim, kernel_size=1)
+        self.tconv_medium = nn.Conv3d(dim, dim, kernel_size=(5, 1, 1),
+                                      padding=(2, 0, 0), groups=dim)
+        self.tconv_large = nn.Conv3d(dim, dim, kernel_size=(7, 1, 1),
+                                     padding=(3, 0, 0), groups=dim)
+        self.tconv_fuse = nn.Conv3d(dim * 3, dim, kernel_size=1)
 
         # 时间注意力门控
         self.t_gate = nn.Sequential(
@@ -141,10 +143,11 @@ class DSTTimeBlock(nn.Module):
         x_norm = self.norm(x)
         v = self.v_proj(x_norm)
 
-        # 多尺度时序特征提取
-        t_small = self.tconv_small(v)  # 快速运动
-        t_large = self.tconv_large(v)  # 慢速滑动
-        t_feat = self.tconv_fuse(torch.cat([t_small, t_large], dim=1))
+        # 三尺度时序特征提取
+        t_small = self.tconv_small(v)   # k=3: 快速运动
+        t_medium = self.tconv_medium(v)  # k=5: 慢速滑动
+        t_large = self.tconv_large(v)   # k=7: 整体趋势
+        t_feat = self.tconv_fuse(torch.cat([t_small, t_medium, t_large], dim=1))
 
         # 门控机制：自适应选择关注帧间变化
         gate = self.t_gate(t_feat)
