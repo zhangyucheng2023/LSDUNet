@@ -33,6 +33,26 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def get_layerscale_weights(model):
+    """
+    收集所有 DSTLayer 中 LayerScale 残差权重的平均值。
+    返回 (w_time, w_space, w_lrta, w_ffn) 四个标量，用于监控训练过程中各模块的贡献变化。
+    """
+    w_time_vals, w_space_vals, w_lrta_vals, w_ffn_vals = [], [], [], []
+    for _, module in model.named_modules():
+        if isinstance(module, DSTLayer):
+            w_time_vals.append(module.w_time.data.mean().item())
+            w_space_vals.append(module.w_space.data.mean().item())
+            w_lrta_vals.append(module.w_lrta.data.mean().item())
+            w_ffn_vals.append(module.w_ffn.data.mean().item())
+    if not w_time_vals:
+        return 0.0, 0.0, 0.0, 0.0
+    return (sum(w_time_vals) / len(w_time_vals),
+            sum(w_space_vals) / len(w_space_vals),
+            sum(w_lrta_vals) / len(w_lrta_vals),
+            sum(w_ffn_vals) / len(w_ffn_vals))
+
+
 def main(cs_ratio):
     ck_file_name = f'lsdunet_{cs_ratio}.pth'
 
@@ -84,13 +104,27 @@ def main(cs_ratio):
     csv_writer = csv.writer(log_file)
     csv_writer.writerow(['epoch', 'train_loss', 'loss_type', 'val_psnr', 'val_ssim', 'val_lpips',
                          'val_edge_psnr', 'val_roi_psnr', 'val_roi_ssim',
-                         'lr', 'best_psnr', 'time_s'])
+                         'lr', 'best_psnr', 'time_s',
+                         'w_time', 'w_space', 'w_lrta', 'w_ffn'])
 
+    nll_activated = False
     for epoch in range(1, args.epochs + 1):
         start_ = time.time()
         current_lr = optimizer.param_groups[0]['lr']
         print('current lr {:.5e}'.format(current_lr))
+
+        # NLL warm-up: 先用 MSE 稳定 mean head，达到条件后切换
         use_nll = (epoch > args.nll_warmup)
+        if use_nll and not nll_activated:
+            if args.nll_min_psnr > 0 and best_val_psnr < args.nll_min_psnr:
+                use_nll = False  # PSNR 未达标，继续 MSE
+            else:
+                nll_activated = True
+                print('\n' + '=' * 60)
+                print('  NLL warm-up complete at epoch %d' % epoch)
+                print('  Switching from MSE → NLL (heteroscedastic uncertainty)')
+                print('=' * 60 + '\n')
+
         loss = train_3d(train_loader, model, criterion, optimizer, device,
                         grad_clip=args.grad_clip, use_nll=use_nll)
 
@@ -133,6 +167,13 @@ def main(cs_ratio):
         print('Running time: {:.2f} seconds'.format(elapsed))
         print()
 
+        # 收集 LayerScale 权重变化，监控各模块贡献
+        w_time, w_space, w_lrta, w_ffn = get_layerscale_weights(model)
+        writer.add_scalar('Weights/w_time', w_time, epoch)
+        writer.add_scalar('Weights/w_space', w_space, epoch)
+        writer.add_scalar('Weights/w_lrta', w_lrta, epoch)
+        writer.add_scalar('Weights/w_ffn', w_ffn, epoch)
+
         csv_writer.writerow([epoch, f'{loss:.6f}', 'NLL' if use_nll else 'MSE',
                              f'{val_psnr:.4f}',
                              f'{val_ssim:.6f}',
@@ -140,7 +181,9 @@ def main(cs_ratio):
                              f'{val_edge_psnr:.4f}', f'{val_roi_psnr:.4f}',
                              f'{val_roi_ssim:.6f}',
                              f'{current_lr:.2e}',
-                             f'{best_val_psnr:.4f}', f'{elapsed:.1f}'])
+                             f'{best_val_psnr:.4f}', f'{elapsed:.1f}',
+                             f'{w_time:.6e}', f'{w_space:.6e}',
+                             f'{w_lrta:.6e}', f'{w_ffn:.6e}'])
 
     log_file.close()
     writer.close()
@@ -170,7 +213,8 @@ if __name__ == '__main__':
     parser.add_argument('--flr', '--final_learning_rate', default=1e-6, type=float, help='final learning rate')
     parser.add_argument('--wd', '--weight_decay', default=0.05, type=float, help='AdamW weight decay')
     parser.add_argument('--grad_clip', default=1.0, type=float, help='gradient clipping norm')
-    parser.add_argument('--nll_warmup', default=10, type=int, help='epochs to warm up mean head with MSE before NLL')
+    parser.add_argument('--nll_warmup', default=15, type=int, help='epochs to warm up mean head with MSE before NLL')
+    parser.add_argument('--nll_min_psnr', default=0.0, type=float, help='min val PSNR before switching to NLL (0=disabled)')
     parser.add_argument('--save_dir', help='trained models', default='trained_model', type=str)
     parser.add_argument('--iter_num', type=int, default=8, help='3D iteration count')
     parser.add_argument('--model_dim', type=int, default=64, help='feature dimension')

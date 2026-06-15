@@ -30,7 +30,22 @@ def load_3d_model(cs_ratio, checkpoint_path, iter_num=8, model_dim=16, patch=32,
                            model_dim=model_dim, patch=patch,
                            num_heads=num_heads).to(device)
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        model_3d.load_state_dict(checkpoint, strict=False)
+        result = model_3d.load_state_dict(checkpoint, strict=False)
+        if result.missing_keys:
+            print(f"[WARN] Checkpoint missing {len(result.missing_keys)} keys "
+                  f"(new modules will be randomly initialized):")
+            # 按模块分组显示
+            groups = {}
+            for k in result.missing_keys:
+                prefix = k.split('.')[0]
+                groups.setdefault(prefix, []).append(k)
+            for prefix, keys in groups.items():
+                print(f"  - {prefix}: {len(keys)} params (e.g. {keys[0]})")
+        if result.unexpected_keys:
+            print(f"[WARN] Checkpoint has {len(result.unexpected_keys)} unexpected keys "
+                  f"(old modules removed, ignored)")
+        if not result.missing_keys and not result.unexpected_keys:
+            print("[OK] Checkpoint loaded with full parameter match")
         model_3d.eval()
         old_rate_3d = cs_ratio
     return model_3d, device
