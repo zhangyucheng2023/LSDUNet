@@ -139,7 +139,7 @@ class DSTTimeBlock(nn.Module):
         self.out_proj = nn.Conv3d(dim, dim, kernel_size=1)
 
     def forward(self, x):
-        B, C, T, H, W = x.shape
+        _ = x.shape
         x_norm = self.norm(x)
         v = self.v_proj(x_norm)
 
@@ -281,7 +281,7 @@ class GRAD3D(nn.Module):
         )
 
     def forward(self, x, y, S, R):
-        B, C, T, H, W = x.shape
+        B, _, T, H, W = x.shape
         x_proj = self.conv2p(x)
         x_proj_flat = x_proj.permute(0, 2, 1, 3, 4).reshape(B * T, 1, H, W)
         y_flat = y.view(B * T, *y.shape[-3:])
@@ -374,6 +374,14 @@ class AdaptiveSModule(nn.Module):
     内容自适应采样：根据输入信号的能量分布，动态分配测量预算。
     高能量区域（接触面）获得更多有效测量，低能量区域（背景）分配更少。
     等效于非均匀采样率的 variable-rate CS。
+
+    重要性预测器采用渐进下采样（×2 ×2）保留空间细节，
+    最后用 AdaptiveAvgPool2d 对齐到测量分辨率，
+    避免原方案 stride=patch 单步压缩导致的空间信息丢失。
+
+    域不变性设计：InstanceNorm2d 对每张输入独立归一化强度分布，
+    消除不同 GelSight 传感器之间的增益/曝光差异，
+    使重要性预测器在 ToucHD 训练后可直接泛化到 TacQuad/Yuan18。
     """
     def __init__(self, patch, cs_dim):
         super().__init__()
@@ -385,20 +393,27 @@ class AdaptiveSModule(nn.Module):
             kaiming_normal_(torch.Tensor(cs_dim, 1, patch, patch))
         )
 
-        # 轻量重要性预测器：逐 patch 估计信号能量
+        # 渐进式多尺度重要性预测器（含域归一化）
         self.importance_net = nn.Sequential(
-            nn.Conv2d(1, 8, 3, padding=1),
+            nn.InstanceNorm2d(1, affine=True),           # 消除跨传感器强度差异
+            nn.Conv2d(1, 16, 3, padding=1),
             nn.GELU(),
-            nn.Conv2d(8, 8, 3, padding=1, stride=patch),
+            nn.Conv2d(16, 32, 3, stride=2, padding=1),   # H/2
             nn.GELU(),
-            nn.Conv2d(8, cs_dim, 1),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),   # H/4
+            nn.GELU(),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(64, cs_dim, 1),
             nn.Sigmoid(),
         )
 
     def forward(self, x):
-        # x: [B, 1, H, W]
+        # x: [B, 1, H, W] — 单帧灰度图
         y = F.conv2d(x, self.s_weight, stride=self.patch)  # [B, cs_dim, H/patch, W/patch]
-        imp = self.importance_net(x)  # [B, cs_dim, H/patch, W/patch]
+        imp = self.importance_net(x)  # [B, cs_dim, H/4, W/4]
+        # 自适应池化对齐到测量分辨率，保留细粒度空间结构
+        imp = F.adaptive_avg_pool2d(imp, (y.shape[-2], y.shape[-1]))
         y = y * imp  # 重要性加权：高能量区域测量值被放大
         return y
 
@@ -421,6 +436,11 @@ class LongRangeTemporalAttention(nn.Module):
     长程时序依赖建模：用一组可学习时序查询 (Q) 跨注意力到所有 T 帧，
     捕捉超出 8 帧局部窗口的全局时序演化模式。
     复杂度 O(Q×T)，Q=3 个查询覆盖不同时间尺度（快划/慢划/全局）。
+
+    设计动机：触觉滑动信号（快划/慢划）的时序模式在空间上高度一致——
+    整个传感器经历相同的接触-滑动-脱离过程，因此空间池化后做
+    跨注意力是合理的归纳偏置。精细的空间结构由 DSTSpaceBlock 独立建模。
+    若需空间感知的长程时序，可扩展为分组空间池化（如 2×2 网格区域）。
     """
     def __init__(self, dim, num_queries=3, num_heads=4):
         super().__init__()
@@ -441,21 +461,16 @@ class LongRangeTemporalAttention(nn.Module):
         self.kv_proj = nn.Conv3d(dim, dim * 2, 1)
         self.proj = nn.Conv3d(dim, dim, 1)
 
-        # LayerScale: 可学习逐通道残差权重（Touvron et al., ICCV 2021）
-        self.w_lr = nn.Parameter(1e-5 * torch.ones(1, dim, 1, 1, 1))
-
     def forward(self, x):
         B, C, T, H, W = x.shape
         x_norm = self.norm(x)
-
-        # 空间池化 → 时序特征 [B, T, C]
-        x_pool = x_norm.mean(dim=[-2, -1]).permute(0, 2, 1)
 
         # 可学习查询跨注意力
         queries = self.temporal_queries.unsqueeze(0).expand(B, -1, -1)  # [B, Q, C]
         q = self.q_proj(queries).view(B, self.num_queries, self.num_heads, self.head_dim)
         q = q.permute(0, 2, 1, 3)  # [B, H, Q, D]
 
+        # 空间池化：整个传感器面的时序演化高度一致
         kv = self.kv_proj(x_norm).mean(dim=[-2, -1])  # [B, 2C, T]
         k, v = kv.chunk(2, dim=1)
         k = k.permute(0, 2, 1).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)

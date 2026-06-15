@@ -47,6 +47,8 @@ class SequenceVolumeDataset(Dataset):
                 self._seq_dirs.append(seq_dir)
                 for start in range(0, len(frames) - num_frames + 1, max(1, num_frames // 2)):
                     self.samples.append((len(self._seq_dirs) - 1, start))
+        # 初始化时构建缓存，避免多进程 DataLoader 中每个 worker 重复构建
+        self._seq_cache = self._build_cache()
 
     def __len__(self):
         return len(self.samples)
@@ -55,12 +57,7 @@ class SequenceVolumeDataset(Dataset):
         seq_idx, start = self.samples[idx]
         seq_dir = self._seq_dirs[seq_idx]
 
-        seq_cache = getattr(self, '_seq_cache', None)
-        if seq_cache is None:
-            self._seq_cache = self._build_cache()
-            seq_cache = self._seq_cache
-
-        frames = seq_cache[seq_dir]
+        frames = self._seq_cache[seq_dir]
         imgs = []
         for i in range(self.num_frames):
             img = Image.open(frames[start + i]).convert('RGB')

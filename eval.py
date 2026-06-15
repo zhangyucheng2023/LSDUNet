@@ -99,7 +99,7 @@ def eval_3d_temporal(frame_paths, model, device, return_intermediates=False):
                 inter_preds = [im[0, 2, 0, :, :].cpu().numpy() for im in intermediates]
                 all_intermediates.append(inter_preds)
             else:
-                out, _ = model(clip.to(device))
+                out = model(clip.to(device))
         pred = out[0, 2, 0, :, :].cpu().numpy()
         preds.append(pred)
 

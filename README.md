@@ -14,7 +14,9 @@ LSDUNet/
 ├── eval.py               # 评估脚本
 ├── eval_noise.py         # 动态视频抗噪评估
 ├── metrics.py            # 评估指标 (ROI-PSNR, Edge-PSNR, 效率指标)
-└── utils.py              # 工具函数 (设备、种子、色彩空间转换)
+├── utils.py              # 工具函数 (设备、种子、色彩空间转换)
+├── requirements.txt      # Python 依赖
+└── LICENSE               # MIT License
 ```
 
 ## 核心思路
@@ -139,13 +141,54 @@ python train.py
 
 ### 数据集
 
-| 用途 | 数据集 | 说明 |
-|------|--------|------|
-| 训练集 | `dataset/toucHD/train` | ToucHD GelSight，142 条时序序列 |
-| 验证集 | `dataset/touch_and_go` | Touch and Go，140 条时序序列 |
-| 测试集 | tacquad / yuan18 / visgel | 跨域泛化评估 |
+本项目使用 5 个公开触觉数据集进行训练、验证和跨域泛化评估。所有数据集均为直接下载自原始来源的公开数据，无需额外预处理脚本。
 
-输入图片为 8-bit 灰度 PNG，经 `Grayscale() → Resize(128,128) → CenterCrop(96) → ToTensor()` 转为 `[B, T, 1, H, W]` float32 张量（值域 [0, 1]）。
+| 用途 | 数据集 | 规模 | 采集设备 | 来源 |
+|------|--------|------|----------|------|
+| 训练集 | ToucHD | 142 序列，每序列 ~779 帧 | 5 种 GelSight 传感器 | [HuggingFace](https://huggingface.co/datasets/xxuan01/BAAI/ToucHD-Force) |
+| 验证集 | Touch and Go | 142 序列 | GelSight | 公开数据集 |
+| 测试集 | TacQuad | 3 种场景 (sim/real/models) | GelSight | 公开数据集 |
+| 测试集 | Yuan18 | 布匹抓取测试，含 GelSight 视频 | GelSight | 公开数据集 |
+| 测试集 | VisGel | 2 序列 | GelSight | 公开数据集 |
+
+**数据目录结构**：
+```
+dataset/
+├── toucHD/              # 训练集
+│   └── train/           # 142 个序列目录 (obj000_speed1 ~ obj141_speed2)
+│       └── objXXX_speedY/  # 每序列约 779 帧 PNG 灰度图
+├── touch_and_go/        # 验证集 (142 个序列目录)
+├── tacquad/             # 测试集 (test/sim, real, models)
+├── yuan18/              # 测试集 (test/ 含 GelSight 视频帧 + metadata)
+└── visgel/              # 测试集 (images/ 含 2 个序列)
+```
+
+**ToucHD 数据集详情**：
+- 论文: [ToucHD: Large-Scale Tactile Hierarchical Dynamic Dataset](https://arxiv.org/abs/2602.09617)
+- 包含 722,436 触觉-力配对样本
+- 5 种 GelSight 类触觉传感器，71 种不同压头
+- 4 个方向 (前后左右) 的滑动运动，3D 接触力序列
+- 像素级接触压力分布，8-bit 灰度 PNG
+
+**Yuan18 数据集详情**：
+- 布匹抓取与滑动检测数据集
+- 含 GelSight 视频 (`GelSight_video.mp4`) + 背景帧 (`background.png`)
+- 帧率 30 FPS，可用 `ffmpeg` 提取帧
+- 含布匹物理属性元数据 (柔软度、厚度、拉伸性等)
+
+**数据预处理**：
+- 输入: 8-bit 灰度 PNG，`Grayscale() → Resize(128,128) → CenterCrop(96) → ToTensor()`
+- 输出: `[B, T, 1, 96, 96]` float32 张量，值域 [0, 1]
+- 时序构建: 滑动窗口采样，每 8 帧组成一个 3D 体积输入
+- 无需额外预处理脚本，数据集直接下载后即可使用
+
+**数据下载**：
+```bash
+# ToucHD (HuggingFace)
+huggingface-cli download --repo-type dataset xxuan01/BAAI/ToucHD-Force --local-dir dataset/toucHD
+
+# 其他数据集请联系作者或从原始来源获取
+```
 
 ### 主要超参数
 
@@ -231,10 +274,24 @@ python eval_noise.py --single 0.10
 - **RTX 5080 (Blackwell, sm_120)**: 需 PyTorch nightly + CUDA 13.0+
 - **CPU 训练**: 无 GPU 时自动禁用 AMP，使用标准反向传播
 
+## 安装
+
+```bash
+# 克隆项目
+git clone <repo-url>
+cd LSDUNet
+
+# 安装依赖
+pip install -r requirements.txt
+```
+
 ## 依赖
 
-- PyTorch >= 2.5（RTX 5080 需 nightly + CUDA 13.0+）
-- torchvision
-- scikit-image
-- tqdm
-- tensorboard
+- Python >= 3.12
+- PyTorch >= 2.0（推荐 2.5+，RTX 5080 需 CUDA 13.0+）
+- torchvision >= 0.15
+- scikit-image >= 0.21
+- scipy >= 1.10
+- lpips >= 0.1.4
+- tqdm, tensorboard, matplotlib
+- 完整依赖见 `requirements.txt`
