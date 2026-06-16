@@ -18,22 +18,13 @@ warnings.filterwarnings("ignore")
 
 
 def loss_fun(mean, target, log_var=None, beta=0.5):
-    """
-    β-NLL (Seitzer et al., ICLR 2022): weighted Negative Log-Likelihood
-    with heteroscedastic uncertainty.
-    When log_var is None, falls back to standard MSE.
-    β=0 → standard NLL (Kendall & Gal, NeurIPS 2017)
-    β=0.5 → β-NLL (recommended value from Seitzer et al.)
-    β-NLL mitigates the problem of variance collapse by weighting
-    each loss term by σ^(2β) = exp(β·log_var) = stop_grad(exp(β·log_var)).
-    """
+    """β-NLL loss with heteroscedastic uncertainty. Falls back to MSE when log_var is None."""
     if log_var is not None:
         # β-NLL: L = 0.5 * (log_var + (mean - target)^2 * exp(-log_var)) * stop_grad(exp(beta * log_var))
         #        = 0.5 * (log_var + precision * error^2) * exp(beta * log_var).detach()
         precision = torch.exp(-log_var)
         nll_term = 0.5 * (log_var + precision * (mean - target) ** 2)
         if beta > 0:
-            # Detach the weighting to avoid gradient dependency on variance
             weight = torch.exp(beta * log_var).detach()
             loss = nll_term * weight
         else:
@@ -47,10 +38,7 @@ def count_parameters(model):
 
 
 def get_layerscale_weights(model):
-    """
-    收集所有 DSTLayer 中 LayerScale 残差权重的平均值。
-    返回 (w_time, w_space, w_lrta, w_ffn) 四个标量，用于监控训练过程中各模块的贡献变化。
-    """
+    """Collect average LayerScale weights from all DSTLayer modules."""
     w_time_vals, w_space_vals, w_lrta_vals, w_ffn_vals = [], [], [], []
     for _, module in model.named_modules():
         if isinstance(module, DSTLayer):

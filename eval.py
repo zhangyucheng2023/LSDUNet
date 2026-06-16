@@ -63,10 +63,7 @@ def _load_frame(path):
 
 
 def _build_temporal_clip(frame_buffer, center_idx, clip_len=8):
-    """
-    从预加载的帧缓冲区中，以 center_idx 为中心构建 [clip_len, 1, H, W] 时序片段。
-    边界帧使用边缘复制补齐。
-    """
+    """Build [clip_len, 1, H, W] clip centered at center_idx, with edge replication."""
     n = len(frame_buffer)
     half = clip_len // 2
     indices = []
@@ -80,12 +77,8 @@ def _build_temporal_clip(frame_buffer, center_idx, clip_len=8):
 
 def eval_3d_temporal(frame_paths, model, device, return_intermediates=False,
                       return_uncertainty=False):
-    """
-    时序数据集滑动窗口评估。
-    对每一帧 i，以其为中心构建 8 帧滑动窗口 [i-4, ..., i+3] 输入模型，
-    取中间第 5 帧（索引 4）作为第 i 帧的重建结果。边界帧边缘复制补齐。
-    """
-    T_clip = 8  # 与训练时 num_frames 一致
+    """Sliding window evaluation with T_clip=8."""
+    T_clip = 8
     n_frames = len(frame_paths)
     frame_buffer = [_load_frame(p) for p in frame_paths]
 
@@ -118,10 +111,7 @@ def eval_3d_temporal(frame_paths, model, device, return_intermediates=False,
 
 
 def save_uncertainty_heatmaps(preds, targets, log_vars, seq_name, out_dir, n_samples=5):
-    """
-    自动生成不确定性可视化热力图。
-    为每个序列选取前 n_samples 帧，生成三列并排图：
-    [输入帧 | 重建帧 | 不确定性热力图 (σ = exp(log_var/2))]"""
+    """Save uncertainty heatmap visualization."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt

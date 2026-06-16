@@ -6,7 +6,7 @@ from math import log10, exp
 import torch.nn.functional as F
 from skimage.metrics import structural_similarity as ssim_count
 
-# 安全设备检测：尝试 CUDA 计算，失败则回退 CPU
+# ─── Device ───
 def _get_device(device_id="cuda:0"):
     if torch.cuda.is_available():
         try:

@@ -7,7 +7,6 @@ from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 from metrics import compute_roi_mask
 
-# LPIPS — 首次加载时会从 torch hub 下载权重，内网环境可能需要关闭 SSL 验证
 try:
     import ssl
     import warnings
@@ -51,7 +50,7 @@ def train_3d(train_loader, model, criterion, optimizer, device, grad_clip=1.0, u
 
     for inputs, _ in pbar:
         inputs = inputs.to(device)
-        B, T, C, H, W = inputs.shape  # [B, T, 1, H, W], already [0,1] from ToTensor
+        B, T, C, H, W = inputs.shape  # [B, T, 1, H, W]
         y_ch = inputs
         optimizer.zero_grad()
 
@@ -64,7 +63,6 @@ def train_3d(train_loader, model, criterion, optimizer, device, grad_clip=1.0, u
                 else:
                     outputs = model(y_ch)
                     loss = criterion(outputs, y_ch)
-                # 方案 B 正交正则化：鼓励 K 个基矩阵学习不同采样模式
                 loss = loss + 0.01 * model.adaptive_s.ortho_loss()
             scaler.scale(loss).backward()
             if grad_clip > 0:

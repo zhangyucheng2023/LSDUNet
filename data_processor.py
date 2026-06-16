@@ -15,10 +15,7 @@ def _parse_frame_num(filename):
 
 
 def collect_sequences(root_dir, min_frames=8, frame_filter=None):
-    """
-    收集时序序列。可选 frame_filter: set of (dir_name, file_name) 来过滤帧。
-    例如 {('seq_001', '0000000001.jpg'), ...}
-    """
+    """Collect temporal sequences with minimum frame count."""
     sequences = {}
     for dirpath, _, filenames in os.walk(root_dir, followlinks=True):
         dir_name = os.path.basename(dirpath)
@@ -28,7 +25,6 @@ def collect_sequences(root_dir, min_frames=8, frame_filter=None):
             key=lambda p: _parse_frame_num(os.path.basename(p))
         )
         if frame_filter is not None:
-            # 按叶子目录名过滤: (叶子目录名, 文件名)
             frames = [p for p in frames
                       if (dir_name, os.path.basename(p)) in frame_filter]
         if len(frames) >= min_frames:
@@ -56,13 +52,11 @@ class SequenceVolumeDataset(Dataset):
     def __getitem__(self, idx):
         seq_idx, start = self.samples[idx]
         seq_dir = self._seq_dirs[seq_idx]
-
         frames = self._seq_cache[seq_dir]
         imgs = []
         for i in range(self.num_frames):
             img = Image.open(frames[start + i]).convert('RGB')
             imgs.append(img)
-
         if self.transform:
             seed = torch.initial_seed()
             transformed = []
@@ -70,7 +64,6 @@ class SequenceVolumeDataset(Dataset):
                 torch.manual_seed(seed)
                 transformed.append(self.transform(img))
             imgs = transformed
-
         volume = torch.stack(imgs, dim=0)
         return volume, 0
 
@@ -87,6 +80,7 @@ class SequenceVolumeDataset(Dataset):
 
 
 def collect_ycb_by_object(root_dir):
+    """Collect YCB sequences organized by object."""
     objects = {}
     data_files_dir = None
     for dirpath, dirnames, _ in os.walk(root_dir, followlinks=True):
@@ -94,9 +88,6 @@ def collect_ycb_by_object(root_dir):
             data_files_dir = os.path.join(dirpath, 'data_files')
             break
     if data_files_dir is None:
-        # 兼容两种目录结构:
-        #   A) object/tactile_imgs/*.jpg
-        #   B) object/*.jpg (tacquad 扁平结构)
         for entry in sorted(os.listdir(root_dir)):
             obj_path = os.path.join(root_dir, entry)
             if not os.path.isdir(obj_path):
@@ -120,7 +111,6 @@ def collect_ycb_by_object(root_dir):
                         if h_files:
                             objects[entry + '_gt'] = h_files
             else:
-                # 扁平结构: 目录下直接存放图像
                 imgs = sorted(
                     [os.path.join(obj_path, f) for f in os.listdir(obj_path)
                      if f.lower().endswith(IMG_EXTS) and 'Zone.Identifier' not in f],
@@ -143,7 +133,6 @@ def collect_ycb_by_object(root_dir):
             )
             if imgs:
                 objects[obj_name] = imgs
-
         h_dir = os.path.join(obj_path, 'gt_height_map')
         if os.path.isdir(t_dir) and os.path.isdir(h_dir):
             h_files = sorted(
@@ -153,16 +142,11 @@ def collect_ycb_by_object(root_dir):
             )
             if h_files:
                 objects[obj_name + '_gt'] = h_files
-
     return objects
 
 
 def load_tag_frame_split(split_path):
-    """
-    加载 TAG 帧级别 split 文件。
-    格式: sequence_name,frame_filename.jpg,label[,label...]
-    返回 set of (dir_name, filename) 元组。
-    """
+    """Load TAG frame-level split, returns set of (dir_name, filename)."""
     allowed = set()
     if not os.path.exists(split_path):
         return None
@@ -181,11 +165,7 @@ def load_tag_frame_split(split_path):
 
 
 def collect_visgel_sequences(root_dir, max_recordings=None, min_frames=4):
-    """
-    收集 VisGel 数据集时序序列。
-    结构: touch/0/rec_00000/frame0000.jpg
-    返回 {dirpath: [frame_paths]}
-    """
+    """Collect VisGel temporal sequences. Structure: touch/0/rec_00000/frame0000.jpg"""
     sequences = {}
     count = 0
     for split_dir in sorted(os.listdir(root_dir)):
