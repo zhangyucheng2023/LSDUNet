@@ -17,14 +17,27 @@ import time
 warnings.filterwarnings("ignore")
 
 
-def loss_fun(mean, target, log_var=None):
+def loss_fun(mean, target, log_var=None, beta=0.5):
     """
-    NLL (Negative Log-Likelihood) loss with heteroscedastic uncertainty.
-    当 log_var 为 None 时退化为标准 MSE。
+    β-NLL (Seitzer et al., ICLR 2022): weighted Negative Log-Likelihood
+    with heteroscedastic uncertainty.
+    When log_var is None, falls back to standard MSE.
+    β=0 → standard NLL (Kendall & Gal, NeurIPS 2017)
+    β=0.5 → β-NLL (recommended value from Seitzer et al.)
+    β-NLL mitigates the problem of variance collapse by weighting
+    each loss term by σ^(2β) = exp(β·log_var) = stop_grad(exp(β·log_var)).
     """
     if log_var is not None:
+        # β-NLL: L = 0.5 * (log_var + (mean - target)^2 * exp(-log_var)) * stop_grad(exp(beta * log_var))
+        #        = 0.5 * (log_var + precision * error^2) * exp(beta * log_var).detach()
         precision = torch.exp(-log_var)
-        loss = 0.5 * (log_var + precision * (mean - target) ** 2)
+        nll_term = 0.5 * (log_var + precision * (mean - target) ** 2)
+        if beta > 0:
+            # Detach the weighting to avoid gradient dependency on variance
+            weight = torch.exp(beta * log_var).detach()
+            loss = nll_term * weight
+        else:
+            loss = nll_term
         return loss.mean()
     return F.mse_loss(mean, target)
 
@@ -122,11 +135,12 @@ def main(cs_ratio):
                 nll_activated = True
                 print('\n' + '=' * 60)
                 print('  NLL warm-up complete at epoch %d' % epoch)
-                print('  Switching from MSE → NLL (heteroscedastic uncertainty)')
+                print('  Switching from MSE → β-NLL (Seitzer et al., ICLR 2022)')
                 print('=' * 60 + '\n')
 
         loss = train_3d(train_loader, model, criterion, optimizer, device,
-                        grad_clip=args.grad_clip, use_nll=use_nll)
+                        grad_clip=args.grad_clip, use_nll=use_nll,
+                        beta_nll=args.beta_nll)
 
         if epoch < args.warm_epochs:
             warmup_scheduler.step()
@@ -174,7 +188,7 @@ def main(cs_ratio):
         writer.add_scalar('Weights/w_lrta', w_lrta, epoch)
         writer.add_scalar('Weights/w_ffn', w_ffn, epoch)
 
-        csv_writer.writerow([epoch, f'{loss:.6f}', 'NLL' if use_nll else 'MSE',
+        csv_writer.writerow([epoch, f'{loss:.6f}', 'β-NLL' if use_nll else 'MSE',
                              f'{val_psnr:.4f}',
                              f'{val_ssim:.6f}',
                              f'{val_lpips:.6f}' if val_lpips is not None else 'N/A',
@@ -213,8 +227,9 @@ if __name__ == '__main__':
     parser.add_argument('--flr', '--final_learning_rate', default=1e-6, type=float, help='final learning rate')
     parser.add_argument('--wd', '--weight_decay', default=0.05, type=float, help='AdamW weight decay')
     parser.add_argument('--grad_clip', default=1.0, type=float, help='gradient clipping norm')
-    parser.add_argument('--nll_warmup', default=15, type=int, help='epochs to warm up mean head with MSE before NLL')
+    parser.add_argument('--nll_warmup', default=10, type=int, help='epochs to warm up mean head with MSE before NLL')
     parser.add_argument('--nll_min_psnr', default=0.0, type=float, help='min val PSNR before switching to NLL (0=disabled)')
+    parser.add_argument('--beta_nll', default=0.5, type=float, help='beta for β-NLL loss (0=standard NLL, 0.5=recommended)')
     parser.add_argument('--save_dir', help='trained models', default='trained_model', type=str)
     parser.add_argument('--iter_num', type=int, default=8, help='3D iteration count')
     parser.add_argument('--model_dim', type=int, default=64, help='feature dimension')

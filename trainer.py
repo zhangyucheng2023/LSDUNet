@@ -42,7 +42,7 @@ def compute_lpips_batch(pred, target):
         return _lpips_model(pred_t, target_t).mean().item()
 
 
-def train_3d(train_loader, model, criterion, optimizer, device, grad_clip=1.0, use_nll=True):
+def train_3d(train_loader, model, criterion, optimizer, device, grad_clip=1.0, use_nll=True, beta_nll=0.5):
     model.train()
     sum_loss = 0
     use_amp = (device.type == 'cuda')
@@ -60,10 +60,12 @@ def train_3d(train_loader, model, criterion, optimizer, device, grad_clip=1.0, u
                 if use_nll:
                     mean, log_var = model(y_ch, return_uncertainty=True)
                     log_var = torch.clamp(log_var, min=-10, max=10)
-                    loss = criterion(mean, y_ch, log_var)
+                    loss = criterion(mean, y_ch, log_var, beta=beta_nll)
                 else:
                     outputs = model(y_ch)
                     loss = criterion(outputs, y_ch)
+                # 方案 B 正交正则化：鼓励 K 个基矩阵学习不同采样模式
+                loss = loss + 0.01 * model.adaptive_s.ortho_loss()
             scaler.scale(loss).backward()
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -73,10 +75,11 @@ def train_3d(train_loader, model, criterion, optimizer, device, grad_clip=1.0, u
         else:
             if use_nll:
                 mean, log_var = model(y_ch, return_uncertainty=True)
-                loss = criterion(mean, y_ch, log_var)
+                loss = criterion(mean, y_ch, log_var, beta=beta_nll)
             else:
                 outputs = model(y_ch)
                 loss = criterion(outputs, y_ch)
+            loss = loss + 0.01 * model.adaptive_s.ortho_loss()
             loss.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)

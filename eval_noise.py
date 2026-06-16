@@ -88,7 +88,7 @@ def eval_noise_robustness(frame_paths, model, device, sigma):
         metrics_noisy: list of dicts, one per frame (noisy metrics)
         temporal_psnr_clean, temporal_psnr_noisy
     """
-    T_clip = 4
+    T_clip = 8  # 与训练时 num_frames 一致
     n_frames = len(frame_paths)
     frame_buffer = [_load_frame(p) for p in frame_paths]
 
@@ -113,8 +113,8 @@ def eval_noise_robustness(frame_paths, model, device, sigma):
             out_clean = model(clean_clip.to(device))
             out_noisy = model(noisy_clip.to(device))
 
-        clean_pred = out_clean[0, 2, 0, :, :].cpu().numpy()
-        noisy_pred = out_noisy[0, 2, 0, :, :].cpu().numpy()
+        clean_pred = out_clean[0, T_clip // 2, 0, :, :].cpu().numpy()
+        noisy_pred = out_noisy[0, T_clip // 2, 0, :, :].cpu().numpy()
         clean_preds.append(clean_pred)
         noisy_preds.append(noisy_pred)
 
@@ -228,9 +228,9 @@ def main():
     ]:
         if os.path.isdir(root):
             if 'visgel' in root.lower():
-                seqs = collect_visgel_sequences(root, min_frames=4)
+                seqs = collect_visgel_sequences(root, min_frames=8)
             else:
-                seqs = collect_sequences(root, min_frames=4)
+                seqs = collect_sequences(root, min_frames=8)
             if seqs:
                 total = sum(len(v) for v in seqs.values())
                 datasets[name] = seqs

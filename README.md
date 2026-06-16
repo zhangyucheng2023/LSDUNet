@@ -1,19 +1,20 @@
 # LSDUNet — Learned Spatial-temporal Deep Unfolding Network for Tactile Image Compressed Sensing
 
-基于**压缩感知 + 深度展开优化**的触觉图像重建网络，使用极少量测量值重建高质量触觉压力分布图。采用混合架构：**浅层 3D 卷积 Token 化 + 深层 DST (Divided Space-Time) 可变形时空注意力 + 长程时序注意力 + 不确定性量化**。
+基于**压缩感知 + 低秩稀疏分解深度展开**的触觉图像重建网络，使用极少量测量值重建高质量触觉压力分布图。采用混合架构：**浅层 3D 卷积 Token 化 + 深层 DST (Divided Space-Time) 可变形时空注意力 + 长程时序注意力 + β-NLL 异方差不确定性量化**。
 
 ## 项目结构
 
 ```
 LSDUNet/
 ├── model/
-│   └── model_3d.py      # 核心模型定义 (LSDUNet, AdaptiveSModule, DSTLayer, LongRangeTemporalAttention)
+│   ├── __init__.py      # 模块导出
+│   └── model_3d.py      # 核心模型 (LSDUNet, AdaptiveSModule, ConvTokenizer3D, DSTLayer, LongRangeTemporalAttention)
 ├── data_processor.py     # 数据集加载与预处理
 ├── trainer.py            # 训练/验证循环
 ├── train.py              # 训练入口脚本
-├── eval.py               # 评估脚本
+├── eval.py               # 评估脚本 (含不确定性可视化)
 ├── eval_noise.py         # 动态视频抗噪评估
-├── metrics.py            # 评估指标 (ROI-PSNR, Edge-PSNR, 效率指标)
+├── metrics.py            # 评估指标 (ROI-PSNR, Edge-PSNR, Temporal-PSNR, 效率指标)
 ├── utils.py              # 工具函数 (设备、种子、色彩空间转换)
 ├── requirements.txt      # Python 依赖
 └── LICENSE               # MIT License
@@ -21,30 +22,33 @@ LSDUNet/
 
 ## 核心思路
 
-### 1. 自适应压缩感知 (CS) 采样
+### 1. 自适应压缩感知 (CS) 采样 — 多基矩阵动态组合
 
-触觉图像被分块压缩采样，通过**内容感知的自适应采样矩阵**降低测量维度：
-
+触觉图像被分块压缩采样，通过**内容感知的多基矩阵动态组合**降低测量维度：
+       
 ```
 y = S(x) · imp(x)   [自适应采样: AdaptiveSModule, 重要性加权]
-ẋ = R(y)             [初始反投影: RModule, ConvTranspose2d]
+ẋ = R(y, s_dyn)      [初始反投影: RModule, per-sample ConvTranspose2d]
 ```
 
-- **自适应采样矩阵 (AdaptiveSModule)**: 轻量 CNN 预测逐 patch 信号能量，高能量区域（接触面）获得更多有效测量，等效于 variable-rate CS
+- **多基矩阵动态组合 (Mixture-of-Basis)**: 学习 K=4 个基采样矩阵，轻量 meta-network (~1K 参数) 根据输入统计量动态组合。不同传感器模式自动选择不同的基矩阵组合，实现跨域泛化
+- **正交正则化**: 鼓励 K 个基矩阵学习互不重叠的采样模式，最大化组合多样性
+- **重要性预测器**: 轻量 CNN 预测逐 patch 信号能量，高能量区域（接触面）获得更多有效测量，等效于 variable-rate CS
+- **域不变性**: InstanceNorm2d 消除不同 GelSight 传感器之间的增益/曝光差异
 - 输入尺寸经 `patch=32` 分块，压缩比由 `sensing_rate` 控制
-- 采样矩阵作为网络参数端到端学习，无需手工设计测量矩阵
 
 ### 2. 浅层 3D 卷积 Token 化 (ConvTokenizer3D)
 
 替代传统 ViT 的线性 Patch 划分，用**三层渐进式 3D 卷积**替代简单投影，起到"卷积投影作为 Token 接入"的作用：
 
-| 阶段 | 卷积核 | 作用 |
-|------|--------|------|
-| `stem1` | `(3, 5, 5)` | 大空间感受野提取轮廓 |
-| `stem2` | `(3, 3, 3)` | 时空联合特征细化 |
-| `stem3` | `(1, 3, 3)` | 逐帧空间特征压缩 |
+| 阶段 | 卷积核 | 归一化 | 作用 |
+|------|--------|--------|------|
+| `stem1` | `(3, 5, 5)` | GroupNorm(2,4) | 大空间感受野提取轮廓 |
+| `stem2` | `(3, 3, 3)` | GroupNorm(4,8) | 时空联合特征细化 |
+| `stem3` | `(1, 3, 3)` | GroupNorm(4,16) | 逐帧空间特征压缩 |
 
-同时配备**边缘增强分支**：Sobel-style 空间边缘卷积 + 帧间差分卷积，专门捕捉压力梯度和物体轮廓，抑制高频传感器噪声。
+- **域不变性**: 使用 GroupNorm 替代 BatchNorm3d，对每个样本独立归一化，不依赖跨 batch 统计量，推理时不受训练域 (ToucHD) 的 running stats 影响，天然支持跨传感器泛化
+- 同时配备**边缘增强分支**：Sobel-style 空间边缘卷积 + 帧间差分卷积，专门捕捉压力梯度和物体轮廓，抑制高频传感器噪声
 
 ### 3. DST 可变形时空注意力 + 长程时序 (DSTLayer)
 
@@ -59,14 +63,25 @@ y = S(x) · imp(x)   [自适应采样: AdaptiveSModule, 重要性加权]
 
 **LayerScale 残差权重**: 所有残差分支权重初始化为 `1e-5`，初始时网络退化为恒等映射，训练中逐步学习各模块贡献，训练结束后可分析各模块的最终权重。
 
-### 4. 梯度去噪块 (GDB3D)
+### 4. 梯度去噪块 (GDB3D) — 低秩稀疏分解深度展开
 
-深度展开优化框架，将迭代优化过程展开为神经网络层：
+模仿传统压缩感知的低秩稀疏分解优化问题，深度展开为 8 轮神经网络：
 
-| 子模块 | 功能 |
-|--------|------|
-| `GRAD3D` | 计算测量残差 `y − S(x)`，反投影得到梯度修正量 |
-| `DENO3D` | U-Net 风格 3 级下采样 → 瓶颈混合 (5×5 Conv) → 3 级上采样去噪 |
+```
+目标: min_x  ½ ||y - Sx||₂² + λ_low·σ_low(x) + λ_sparse·||x||₁
+```
+
+其中 `σ_low(x)` 为低秩正则（触觉背景的全局结构），`||x||₁` 为稀疏正则（接触区域的局部压力分布）。
+
+| 子模块 | 功能 | 对应优化项 |
+|--------|------|------------|
+| `GRAD3D` | 计算测量残差 `y − S(x)`，反投影得到梯度修正量 | 数据一致性项 `½ ||y - Sx||₂²` |
+| `DENO3D` | U-Net 风格 3 级下采样 → 瓶颈 5×5 卷积 → 3 级上采样去噪 | 先验项近端算子 `prox(λ·P(x))` |
+
+- **8 轮迭代**逐步细化：从粗略初始反投影 `S^T y` 到高质量重建
+- 每轮均使用当前动态采样矩阵 `s_dyn` 保持数据一致性
+- DST 时空注意力隐式学习低秩时序结构 + 稀疏空间结构
+- 所有 3D 卷积使用 `GroupNorm`，不依赖 batch 统计量，天然跨域泛化
 
 ### 5. 深度展开迭代
 
@@ -78,15 +93,16 @@ for i = 1..8:
     x = DSTLayer[i](x)          # 时间 → 空间 → 长程时序 → FFN
 ```
 
-### 6. 不确定性量化 (Heteroscedastic NLL)
+### 6. 不确定性量化 (β-NLL Heteroscedastic Uncertainty)
 
-遵循 Kendall & Gal (2017) 的异方差不确定性框架：
+遵循 Kendall & Gal (NeurIPS 2017) 的异方差不确定性框架，并采用 Seitzer et al. (ICLR 2022) 的 β-NLL 改进：
 
-- **双头输出**: `proj_out` 预测均值 μ，`proj_var` 预测对数方差 log σ²
-- **NLL 损失**: `L = 0.5 × (log σ² + (μ − y)² / σ²)`
-- **NLL warm-up**: 前 10 epochs 用纯 MSE 稳定 mean head，之后开启 NLL 联合训练
-- **log_var clamp**: 限制在 [-10, 10] 防止数值溢出
-- 评估时仅使用 mean head，零额外推理开销
+- **双头输出**: `proj_out` 预测均值 μ，`proj_var` 预测对数方差 log σ²，输出端 clamp 到 [-10, 10] 防止数值溢出
+- **β-NLL 损失**: `L = 0.5 × (log σ² + (μ − y)² / σ²) × stop_grad(σ^(2β))`，β=0.5 为推荐值
+- **方差坍缩抑制**: β-NLL 通过 stop_grad 权重项防止方差趋近于 0，比标准 NLL warm-up 更原则性
+- **NLL warm-up**: 前 10 epochs 用纯 MSE 稳定 mean head，之后开启 β-NLL 联合训练
+- **正交正则化**: 训练损失附加 `0.01 × ortho_loss`，鼓励基矩阵学习不同采样模式
+- 评估时仅使用 mean head，零额外推理开销；`--save_uncertainty` 可生成 σ 热力图
 
 ## 数据流
 
@@ -95,15 +111,15 @@ for i = 1..8:
         │
         ▼
   ┌──────────────┐
-  │AdaptiveSModule│  ← 自适应 CS 采样 + 重要性加权
+  │AdaptiveSModule│  ← 多基动态 CS 采样 + 重要性加权 → (y, s_dyn)
   └──────┬───────┘
          │
   ┌──────▼───────┐
-  │   RModule    │  ← 初始反投影重建
+  │   RModule    │  ← 初始反投影重建 (per-sample s_dyn)
   └──────┬───────┘
          │
   ┌──────▼────────────┐
-  │ ConvTokenizer3D   │  ← 浅层 3D 卷积提取边缘/纹理 Token
+  │ ConvTokenizer3D   │  ← 浅层 3D 卷积 + GroupNorm + 边缘增强
   └──────┬────────────┘
          │
   ┌──────▼──────────────────────────────────────────┐
@@ -120,21 +136,26 @@ for i = 1..8:
 
 | 设计 | 动机 |
 |------|------|
-| 3D 体积（多帧堆叠） | 利用帧间时间冗余提升重建质量 |
-| 自适应 CS 采样 | 高能量区域（接触面）获得更多有效测量，测量预算动态分配 |
+| 3D 体积（8 帧堆叠） | 利用帧间时间冗余提升重建质量 |
+| 多基矩阵动态组合 (K=4) | 不同传感器模式自动选择不同基矩阵，实现跨域泛化 |
+| 正交正则化 (ortho_loss) | 鼓励基矩阵学习互不重叠的采样模式 |
+| GroupNorm 替代 BatchNorm3d | 消除跨传感器域的 running stats 依赖，天然支持跨域泛化 |
 | CS 纯线性采样（无激活） | 保证数据一致性误差的严密物理可解释性 |
+| 低秩稀疏分解深度展开 | 触觉背景低秩 + 接触区域稀疏，GDB3D + DST 隐式建模 |
 | 深度展开 8 轮 | 平衡重建精度与计算开销 |
 | 可变形空间注意力 | 触觉接触区域形状不规则，固定 grid 无法自适应 |
 | 时序门控 | 过滤无意义的帧间传感器噪声 |
 | 长程时序注意力 (3 queries) | 快划/慢划/全局三个时间尺度捕捉全局时序演化 |
 | LayerScale 残差权重 (1e-5) | 初始退化为恒等映射，保证深度展开数值稳定性 |
-| 异方差 NLL 不确定性 | 输出逐像素重建置信度，低置信度区域指示测量不足 |
+| β-NLL 异方差不确定性 (β=0.5) | 输出逐像素重建置信度，抑制方差坍缩 |
 | 边缘增强分支 | 保留物体物理轮廓，抑制触觉传感器高频噪声 |
 
 ## 训练
 
 ```bash
-python train.py
+python train.py                # 默认 β-NLL (β=0.5)
+python train.py --beta_nll 0   # 标准 NLL (Kendall & Gal)
+python train.py --beta_nll 0.5 # β-NLL (Seitzer et al., ICLR 2022 推荐)
 ```
 
 默认依次训练 5 个压缩比：`[0.01, 0.04, 0.10, 0.25, 0.50]`，每个均训练 150 轮。
@@ -206,12 +227,13 @@ huggingface-cli download --repo-type dataset xxuan01/BAAI/ToucHD-Force --local-d
 | `--wd` | 0.05 | AdamW 权重衰减 |
 | `--grad_clip` | 1.0 | 梯度裁剪范数 |
 | `--nll_warmup` | 10 | NLL 预热轮数（前 N epochs 用 MSE） |
+| `--beta_nll` | 0.5 | β-NLL 参数 (0=NLL, 0.5=β-NLL 推荐) |
 | `--train_data` | `dataset/toucHD/train` | 训练集路径 |
 | `--val_dir` | `dataset/touch_and_go` | 验证集路径 |
 
 ### 损失函数与优化
 
-- **损失函数**: NLL (Negative Log-Likelihood) with heteroscedastic uncertainty，warm-up 期间退化为 MSE
+- **损失函数**: β-NLL (Seitzer et al., ICLR 2022) with heteroscedastic uncertainty，warm-up 期间退化为 MSE；附加 `0.01 × ortho_loss` 正交正则化
 - **优化器**: AdamW + CosineAnnealingLR 调度 + Linear Warmup (5 epochs)
 - **混合精度**: AMP (`torch.cuda.amp`) 在 GPU 环境自动启用，CPU 回退标准训练
 - **评估指标**: PSNR + SSIM + LPIPS + Edge-PSNR + ROI-PSNR + ROI-SSIM
@@ -232,12 +254,16 @@ huggingface-cli download --repo-type dataset xxuan01/BAAI/ToucHD-Force --local-d
 ### 标准评估
 
 ```bash
-python eval.py
+python eval.py                      # 标准评估
+python eval.py --save_uncertainty   # 评估 + 自动生成不确定性热力图
+python eval.py --save_uncertainty --uncertainty_ratio 0.10  # 指定 CS 比
 ```
 
-对训练好的模型在测试集上评估，输出 PSNR、SSIM、LPIPS、Edge-PSNR、ROI-PSNR 及推理效率（FPS、FLOPs）。
+对训练好的模型在测试集上评估，输出 PSNR、SSIM、LPIPS、Edge-PSNR、ROI-PSNR、Temporal-PSNR 及推理效率（FPS、FLOPs）。
 
-支持多数据集评估：tacquad、yuan18、visgel（跨域泛化测试）以及 touch_and_go 等。
+支持多数据集评估：tacquad、yuan18、visgel、touch_and_go（跨域泛化测试）。
+
+`--save_uncertainty` 选项会在评估完成后，自动对代表性序列（ToucHD、TacQuad、Yuan18 各取前几个序列）生成三列并排热力图 `[Target | Reconstruction | σ Heatmap]`，并保存 `.npy` 原始数据（preds, targets, log_vars）。
 
 > **注意**: 评估脚本使用 `strict=False` 加载模型权重，兼容新旧 checkpoint。若加载旧 checkpoint，新增模块（自适应采样、长程时序、方差头）将被随机初始化，建议使用新训练的模型。
 
@@ -295,3 +321,13 @@ pip install -r requirements.txt
 - lpips >= 0.1.4
 - tqdm, tensorboard, matplotlib
 - 完整依赖见 `requirements.txt`
+
+## 参考文献
+
+| 方法 | 论文 |
+|------|------|
+| β-NLL 不确定性量化 | Seitzer et al. "On the Pitfalls of Heteroscedastic Uncertainty Estimation with Probabilistic Neural Networks." ICLR, 2022. |
+| 异方差不确定性 | Kendall & Gal. "What Uncertainties Do We Need in Bayesian Deep Learning for Computer Vision?" NeurIPS, 2017. |
+| LayerScale | Touvron et al. "Going Deeper with Image Transformers." ICCV, 2021. |
+| 深度展开 | Gregor & LeCun. "Learning Fast Approximations of Sparse Coding." ICML, 2010. |
+| ToucHD 数据集 | "ToucHD: Large-Scale Tactile Hierarchical Dynamic Dataset." arXiv:2602.09617. |

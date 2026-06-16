@@ -58,6 +58,11 @@ class ConvTokenizer3D(nn.Module):
     浅层 3D 卷积 Token 化（替代原 proj_in 的简单1层投影）
     用轻量级 3D 卷积提取触觉图像的高频边缘特征（物体轮廓、压力梯度），
     起到"将卷积投影作为 Token 接入"的作用，同时抑制高频传感器噪声。
+
+    域不变性设计 (方案 C)：使用 GroupNorm 替代 BatchNorm3d。
+    GroupNorm 对每个样本独立归一化，不依赖跨 batch 统计量，
+    因此推理时不受训练域 (ToucHD) 的 running stats 影响，
+    天然支持跨传感器 (TacQuad/Yuan18) 的域泛化。
     """
     def __init__(self, in_ch=1, dim=16):
         super().__init__()
@@ -65,19 +70,19 @@ class ConvTokenizer3D(nn.Module):
         self.stem1 = nn.Sequential(
             nn.Conv3d(in_ch, dim // 4, kernel_size=(3, 5, 5),
                       padding=(1, 2, 2)),
-            nn.BatchNorm3d(dim // 4),
+            nn.GroupNorm(num_groups=2, num_channels=dim // 4),
             nn.GELU(),
         )
         self.stem2 = nn.Sequential(
             nn.Conv3d(dim // 4, dim // 2, kernel_size=(3, 3, 3),
                       padding=(1, 1, 1)),
-            nn.BatchNorm3d(dim // 2),
+            nn.GroupNorm(num_groups=4, num_channels=dim // 2),
             nn.GELU(),
         )
         self.stem3 = nn.Sequential(
             nn.Conv3d(dim // 2, dim, kernel_size=(1, 3, 3),
                       padding=(0, 1, 1)),
-            nn.BatchNorm3d(dim),
+            nn.GroupNorm(num_groups=4, num_channels=dim),
             nn.GELU(),
         )
         # --- 边缘增强分支：Laplacian-like 高频提取 ---
@@ -114,7 +119,7 @@ class DSTTimeBlock(nn.Module):
     时间块注意力 — 捕捉"滑动轨迹"
     使用多尺度时间卷积提取帧间运动特征，建模接触模式的时序演化。
     """
-    def __init__(self, dim, num_heads=4):
+    def __init__(self, dim, num_heads=8):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -162,7 +167,7 @@ class DSTSpaceBlock(nn.Module):
     学习空间采样偏移，自适应地关注接触区域的几何形状。
     使用 grid_sample 实现 2D 空间可变形。
     """
-    def __init__(self, dim, num_heads=4, num_points=9):
+    def __init__(self, dim, num_heads=8, num_points=9):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -241,7 +246,7 @@ class DSTLayer(nn.Module):
     DST 混合注意力层：时间块 → 空间块 → 长程时序 → FFN
     替换原架构的 CATrans3D + WLTrans3D
     """
-    def __init__(self, dim, num_heads=4, num_offset_points=9):
+    def __init__(self, dim, num_heads=8, num_offset_points=9):
         super().__init__()
         self.dst_time = DSTTimeBlock(dim, num_heads)
         self.dst_space = DSTSpaceBlock(dim, num_heads, num_offset_points)
@@ -280,13 +285,15 @@ class GRAD3D(nn.Module):
             nn.Conv3d(dim, dim, kernel_size=(1, 3, 3), padding=(0, 1, 1))
         )
 
-    def forward(self, x, y, S, R):
+    def forward(self, x, y, S, R, s_dyn):
         B, _, T, H, W = x.shape
         x_proj = self.conv2p(x)
         x_proj_flat = x_proj.permute(0, 2, 1, 3, 4).reshape(B * T, 1, H, W)
         y_flat = y.view(B * T, *y.shape[-3:])
-        err = y_flat - S(x_proj_flat)
-        de_flat = R(err)
+        # 使用与初始采样相同的 s_dyn 计算反投影残差
+        y_proj, _ = S(x_proj_flat, s_fixed=s_dyn)
+        err = y_flat - y_proj
+        de_flat = R(err, s_dyn)
         De = de_flat.view(B, T, *de_flat.shape[-3:]).permute(0, 2, 1, 3, 4)
         De = self.conv2f(De)
         De = De + self.res(De)
@@ -323,7 +330,7 @@ class DENO3D(nn.Module):
         )
         self.res = nn.Sequential(
             nn.Conv3d(dim, dim, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
-            nn.BatchNorm3d(dim),
+            nn.GroupNorm(num_groups=4, num_channels=dim),
             nn.GELU(),
             nn.Conv3d(dim, dim, kernel_size=(1, 3, 3), padding=(0, 1, 1))
         )
@@ -360,8 +367,8 @@ class GDB3D(nn.Module):
         self.grad = GRAD3D(dim)
         self.deno = DENO3D(dim)
 
-    def forward(self, x, y, S, R, x_as_old):
-        x = self.grad(x, y, S, R)
+    def forward(self, x, y, S, R, s_dyn, x_as_old):
+        x = self.grad(x, y, S, R, s_dyn)
         x, x_as_new = self.deno(x, x_as_old)
         return x, x_as_new
 
@@ -371,36 +378,47 @@ class GDB3D(nn.Module):
 # ═══════════════════════════════════════════════════
 class AdaptiveSModule(nn.Module):
     """
-    内容自适应采样：根据输入信号的能量分布，动态分配测量预算。
-    高能量区域（接触面）获得更多有效测量，低能量区域（背景）分配更少。
-    等效于非均匀采样率的 variable-rate CS。
+    内容自适应采样 + 多基矩阵动态组合 (Mixture-of-Basis)
 
-    重要性预测器采用渐进下采样（×2 ×2）保留空间细节，
-    最后用 AdaptiveAvgPool2d 对齐到测量分辨率，
-    避免原方案 stride=patch 单步压缩导致的空间信息丢失。
+    方案 B 设计：
+    - 学习 K 个基采样矩阵（不同传感器模式），而非单一固定矩阵
+    - 轻量 meta-network 根据输入统计量动态组合基矩阵
+    - 正交正则化鼓励基矩阵学习不同的采样模式
+    - 域不变性：InstanceNorm2d 消除跨传感器强度差异
+    - 渐进式重要性预测器保留空间细节
 
-    域不变性设计：InstanceNorm2d 对每张输入独立归一化强度分布，
-    消除不同 GelSight 传感器之间的增益/曝光差异，
-    使重要性预测器在 ToucHD 训练后可直接泛化到 TacQuad/Yuan18。
+    参数开销：meta-net ~1K，几乎不影响推理速度。
     """
-    def __init__(self, patch, cs_dim):
+    def __init__(self, patch, cs_dim, num_basis=4):
         super().__init__()
         self.patch = patch
         self.cs_dim = cs_dim
+        self.num_basis = num_basis
 
-        # 基础采样矩阵
-        self.s_weight = nn.Parameter(
-            kaiming_normal_(torch.Tensor(cs_dim, 1, patch, patch))
+        # K 个基采样矩阵 (Mixture-of-Experts)
+        self.s_basis = nn.Parameter(
+            kaiming_normal_(torch.Tensor(num_basis, cs_dim, 1, patch, patch))
         )
 
-        # 渐进式多尺度重要性预测器（含域归一化）
+        # Meta-network: 根据输入统计量预测基矩阵权重
+        # 输入 [B, 1, H, W] → 输出 [B, K]
+        self.meta_net = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(1, 16),
+            nn.GELU(),
+            nn.Linear(16, num_basis),
+            nn.Softmax(dim=-1),
+        )
+
+        # 重要性预测器（含域归一化）
         self.importance_net = nn.Sequential(
-            nn.InstanceNorm2d(1, affine=True),           # 消除跨传感器强度差异
+            nn.InstanceNorm2d(1, affine=True),
             nn.Conv2d(1, 16, 3, padding=1),
             nn.GELU(),
-            nn.Conv2d(16, 32, 3, stride=2, padding=1),   # H/2
+            nn.Conv2d(16, 32, 3, stride=2, padding=1),
             nn.GELU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),   # H/4
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
             nn.GELU(),
             nn.Conv2d(64, 64, 3, padding=1),
             nn.GELU(),
@@ -408,24 +426,67 @@ class AdaptiveSModule(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, x):
-        # x: [B, 1, H, W] — 单帧灰度图
-        y = F.conv2d(x, self.s_weight, stride=self.patch)  # [B, cs_dim, H/patch, W/patch]
-        imp = self.importance_net(x)  # [B, cs_dim, H/4, W/4]
-        # 自适应池化对齐到测量分辨率，保留细粒度空间结构
+    def _compose_sampling(self, x):
+        """根据输入动态组合基矩阵 → [B, cs_dim, 1, patch, patch]"""
+        B = x.size(0)
+        basis_weights = self.meta_net(x)  # [B, K]
+        # 加权求和: [B, K] @ [K, cs_dim*patch*patch] → [B, cs_dim, 1, patch, patch]
+        s_dyn = torch.einsum('bk,kchw->bchw', basis_weights,
+                             self.s_basis.squeeze(2)).unsqueeze(2)
+        return s_dyn
+
+    def _group_conv2d(self, x, s_dyn):
+        """Group conv2d: 每个样本使用自己的采样矩阵"""
+        B, _, H, W = x.shape
+        s_grp = s_dyn.reshape(B * self.cs_dim, 1, self.patch, self.patch)
+        x_grp = x.view(1, B, H, W)
+        y = F.conv2d(x_grp, s_grp, stride=self.patch, groups=B)
+        return y.view(B, self.cs_dim, y.shape[-2], y.shape[-1])
+
+    def forward(self, x, s_fixed=None):
+        """
+        x: [B, 1, H, W]
+        s_fixed: 可选固定采样矩阵 [B, cs_dim, 1, patch, patch]，
+                 用于梯度反投影步骤中保持与初始采样一致的矩阵。
+        返回 (y, s_dynamic)
+        """
+        if s_fixed is not None:
+            s_dyn = s_fixed
+        else:
+            s_dyn = self._compose_sampling(x)
+
+        # 采样
+        y = self._group_conv2d(x, s_dyn)
+
+        # 重要性加权
+        imp = self.importance_net(x)
         imp = F.adaptive_avg_pool2d(imp, (y.shape[-2], y.shape[-1]))
-        y = y * imp  # 重要性加权：高能量区域测量值被放大
-        return y
+        y = y * imp
+        return y, s_dyn
+
+    def ortho_loss(self):
+        """正交正则化：鼓励 K 个基矩阵学习不同的采样模式"""
+        basis_flat = self.s_basis.view(self.num_basis, -1)
+        basis_norm = F.normalize(basis_flat, dim=1)
+        ortho = basis_norm @ basis_norm.T
+        target = torch.eye(self.num_basis, device=ortho.device)
+        return (ortho - target).pow(2).mean()
 
 
 class RModule(nn.Module):
-    def __init__(self, patch, s_weight):
+    """重建模块：使用 per-sample 采样矩阵做反投影 (方案 B)"""
+    def __init__(self, patch):
         super().__init__()
         self.patch = patch
-        self.s_weight = s_weight
 
-    def forward(self, y):
-        return F.conv_transpose2d(y, self.s_weight, stride=self.patch)
+    def forward(self, y, s_dyn):
+        # y: [B, cs_dim, H/P, W/P]
+        # s_dyn: [B, cs_dim, 1, P, P]
+        B, cs_dim, Hq, Wq = y.shape
+        y_grp = y.view(1, B * cs_dim, Hq, Wq)
+        s_grp = s_dyn.reshape(B * cs_dim, 1, self.patch, self.patch)
+        x_r = F.conv_transpose2d(y_grp, s_grp, stride=self.patch, groups=B)
+        return x_r.view(B, 1, x_r.shape[-2], x_r.shape[-1])
 
 
 # ═══════════════════════════════════════════════════
@@ -442,7 +503,7 @@ class LongRangeTemporalAttention(nn.Module):
     跨注意力是合理的归纳偏置。精细的空间结构由 DSTSpaceBlock 独立建模。
     若需空间感知的长程时序，可扩展为分组空间池化（如 2×2 网格区域）。
     """
-    def __init__(self, dim, num_queries=3, num_heads=4):
+    def __init__(self, dim, num_queries=3, num_heads=8):
         super().__init__()
         self.dim = dim
         self.num_queries = num_queries
@@ -503,9 +564,9 @@ class LSDUNet(nn.Module):
         self.full_dim = patch ** 2
         self.cs_dim = int(ratio * self.full_dim)
 
-        # ── D. 自适应采样矩阵：内容感知的重要性加权 ──
+        # ── D. 自适应采样矩阵：多基动态组合 (方案 B) ──
         self.adaptive_s = AdaptiveSModule(self.patch, self.cs_dim)
-        self.R = RModule(self.patch, self.adaptive_s.s_weight)
+        self.R = RModule(self.patch)
 
         # ── 替换：ConvTokenizer3D 替代原 proj_in ──
         self.tokenizer = ConvTokenizer3D(in_ch=1, dim=self.model_dim)
@@ -523,8 +584,8 @@ class LSDUNet(nn.Module):
         B, T, _, H, W = x.shape
         x_flat = x.view(B * T, 1, H, W)
 
-        y = self.adaptive_s(x_flat)   # 自适应采样
-        x_r = self.R(y)
+        y, s_dyn = self.adaptive_s(x_flat)   # 多基动态采样，返回 (测量值, 采样矩阵)
+        x_r = self.R(y, s_dyn)            # 反投影，使用 per-sample 采样矩阵
 
         # 重塑为 3D 格式 [B, 1, T, H, W]
         x_r = x_r.view(B, T, 1, H, W).permute(0, 2, 1, 3, 4)
@@ -536,7 +597,7 @@ class LSDUNet(nn.Module):
         x_as = None
         intermediates = []  # 中间结果列表（用于 rank 追踪）
         for i in range(self.iter_num):
-            x, x_as = self.gdb[i](x, y, self.adaptive_s, self.R, x_as)
+            x, x_as = self.gdb[i](x, y, self.adaptive_s, self.R, s_dyn, x_as)
             x = self.dst[i](x)
             if return_intermediates:
                 # 投影到图像空间获取中间重建结果
@@ -549,8 +610,9 @@ class LSDUNet(nn.Module):
         x_mean = x_mean.permute(0, 2, 1, 3, 4)  # [B, T, 1, H, W]
 
         if return_uncertainty:
-            # 对数方差预测（取负值确保数值稳定）→ 不确定性 heatmap
+            # 对数方差预测 — clamp 到安全范围防止数值溢出
             log_var = self.proj_var(x)
+            log_var = torch.clamp(log_var, min=-10, max=10)
             log_var = log_var.permute(0, 2, 1, 3, 4)  # [B, T, 1, H, W]
             if return_intermediates:
                 return x_mean, log_var, intermediates

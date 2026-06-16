@@ -186,7 +186,7 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
 
 
-def measure_flops(model, input_shape=(1, 4, 1, 96, 96), device='cpu', verbose=False):
+def measure_flops(model, input_shape=(1, 8, 1, 96, 96), device='cpu', verbose=False):
     """
     使用 fvcore 测量 FLOPs (G)。
     若未安装 fvcore，返回 None。
@@ -204,10 +204,10 @@ def measure_flops(model, input_shape=(1, 4, 1, 96, 96), device='cpu', verbose=Fa
         return None
 
 
-def measure_fps(model, input_shape=(1, 4, 1, 96, 96), device='cpu', warmup=10, repeats=100):
+def measure_fps(model, input_shape=(1, 8, 1, 96, 96), device='cpu', warmup=10, repeats=100):
     """
     测量推理帧率 FPS (frames per second)。
-    输入 clip = [1, 4, 1, 96, 96]，模型输出中取中间帧，所以 FPS 即 clip/s。
+    输入 clip = [1, 8, 1, 96, 96]，模型输出中取中间帧，所以 FPS 即 clip/s。
     """
     import torch
     import time
@@ -288,7 +288,7 @@ def compute_temporal_psnr(preds, targets, data_range=1.0):
 # 8. 一站式效率获取接口
 # ═══════════════════════════════════════════════════════════
 
-def get_efficiency_metrics(model, input_shape=(1, 4, 1, 96, 96), device='cpu',
+def get_efficiency_metrics(model, input_shape=(1, 8, 1, 96, 96), device='cpu',
                            verbose=True):
     """
     一站式获取计算效率指标。

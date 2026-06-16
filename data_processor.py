@@ -37,7 +37,7 @@ def collect_sequences(root_dir, min_frames=8, frame_filter=None):
 
 
 class SequenceVolumeDataset(Dataset):
-    def __init__(self, sequences, num_frames=4, transform=None):
+    def __init__(self, sequences, num_frames=8, transform=None):
         self.transform = transform
         self.num_frames = num_frames
         self.samples = []
@@ -219,7 +219,7 @@ def data_loader_3d(args, root='./',
                    val_split=None):
     kwopt = {'num_workers': 8, 'pin_memory': True, 'prefetch_factor': 4, 'persistent_workers': True}
     w_size, h_size = int(16 * 8), int(16 * 8)
-    num_frames = getattr(args, 'num_frames', 4)
+    num_frames = getattr(args, 'num_frames', 8)
 
     trn_transforms = torchvision.transforms.Compose([
         torchvision.transforms.Resize((w_size, h_size)),
