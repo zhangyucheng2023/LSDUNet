@@ -146,7 +146,7 @@ class DSTSpaceBlock(nn.Module):
         self.v_proj = nn.Conv3d(dim, dim, kernel_size=1)
         self.out_proj = nn.Conv3d(dim, dim, kernel_size=1)
 
-    def forward(self, x):
+    def forward(self, x, return_attn=False):
         B, C, T, H, W = x.shape
         x_norm = self.norm(x)
         v = self.v_proj(x_norm)
@@ -174,19 +174,26 @@ class DSTSpaceBlock(nn.Module):
         v_flat = v_flat.reshape(B * self.num_heads * T, self.head_dim, H, W)
 
         BHT, P, H_grid, W_grid, _ = sample_grid.shape
-        sample_grid_flat = sample_grid.reshape(BHT * P, H_grid, W_grid, 2)
-        v_flat_expanded = v_flat.unsqueeze(1).expand(-1, P, -1, -1, -1).reshape(BHT * P, self.head_dim, H_grid, W_grid)
-        sampled_flat = F.grid_sample(v_flat_expanded, sample_grid_flat, mode='bilinear',
-                                     padding_mode='border', align_corners=True)
-        sampled = sampled_flat.reshape(BHT, P, self.head_dim, H_grid, W_grid)
 
         attn_flat = attn.permute(0, 1, 3, 2, 4, 5)
         attn_flat = attn_flat.reshape(B * self.num_heads * T, self.num_points, H, W)
 
+        # Full grid_sample: process all sampling points at once (fastest).
+        v_expanded = v_flat.unsqueeze(1).expand(-1, P, -1, -1, -1)
+        v_expanded = v_expanded.reshape(BHT * P, self.head_dim, H, W)
+        sample_grid_flat = sample_grid.reshape(BHT * P, H, W, 2)
+        sampled = F.grid_sample(
+            v_expanded, sample_grid_flat, mode='bilinear',
+            padding_mode='border', align_corners=True)
+        sampled = sampled.reshape(BHT, P, self.head_dim, H, W)
         out = (sampled * attn_flat.unsqueeze(2)).sum(dim=1)
+
         out = out.reshape(B, self.num_heads, T, self.head_dim, H, W)
         out = out.permute(0, 1, 3, 2, 4, 5).reshape(B, C, T, H, W)
         out = self.out_proj(out)
+        if return_attn:
+            attn_map = attn_flat.reshape(B, self.num_heads, T, self.num_points, H, W)
+            return out, attn_map
         return out
 
 
@@ -203,11 +210,23 @@ class DSTLayer(nn.Module):
         self.w_lrta = nn.Parameter(1e-5 * torch.ones(1, dim, 1, 1, 1))
         self.w_ffn = nn.Parameter(1e-5 * torch.ones(1, dim, 1, 1, 1))
 
-    def forward(self, x):
-        x = self.w_time * self.dst_time(x) + x
-        x = self.w_space * self.dst_space(x) + x
-        x = self.w_lrta * self.lrta(x) + x
+    def forward(self, x, return_mechanism=False):
+        t_out = self.dst_time(x)
+        x = self.w_time * t_out + x
+        mech = {}
+        if return_mechanism:
+            s_out, s_attn = self.dst_space(x, return_attn=True)
+            x = self.w_space * s_out + x
+            l_out, l_attn = self.lrta(x, return_attn=True)
+            x = self.w_lrta * l_out + x
+            mech['space_attn'] = s_attn  # [B, H, T, P, H, W]
+            mech['lrta_attn'] = l_attn   # [B, H, Q, T]
+        else:
+            x = self.w_space * self.dst_space(x) + x
+            x = self.w_lrta * self.lrta(x) + x
         x = self.w_ffn * self.ffn(x) + x
+        if return_mechanism:
+            return x, mech
         return x
 
 
@@ -345,13 +364,6 @@ class AdaptiveSModule(nn.Module):
             nn.Sigmoid(),
         )
 
-    def _compose_sampling(self, x):
-        B = x.size(0)
-        basis_weights = self.meta_net(x)
-        s_dyn = torch.einsum('bk,kchw->bchw', basis_weights,
-                             self.s_basis.squeeze(2)).unsqueeze(2)
-        return s_dyn
-
     def _group_conv2d(self, x, s_dyn):
         B, _, H, W = x.shape
         s_grp = s_dyn.reshape(B * self.cs_dim, 1, self.patch, self.patch)
@@ -359,17 +371,22 @@ class AdaptiveSModule(nn.Module):
         y = F.conv2d(x_grp, s_grp, stride=self.patch, groups=B)
         return y.view(B, self.cs_dim, y.shape[-2], y.shape[-1])
 
-    def forward(self, x, s_fixed=None):
+    def forward(self, x, s_fixed=None, return_basis_weights=False):
         if s_fixed is not None:
             s_dyn = s_fixed
+            basis_weights = None
         else:
-            s_dyn = self._compose_sampling(x)
+            basis_weights = self.meta_net(x)
+            s_dyn = torch.einsum('bk,kchw->bchw', basis_weights,
+                                 self.s_basis.squeeze(2)).unsqueeze(2)
 
         y = self._group_conv2d(x, s_dyn)
 
         imp = self.importance_net(x)
         imp = F.adaptive_avg_pool2d(imp, (y.shape[-2], y.shape[-1]))
         y = y * imp
+        if return_basis_weights:
+            return y, s_dyn, basis_weights
         return y, s_dyn
 
     def ortho_loss(self):
@@ -415,11 +432,10 @@ class LongRangeTemporalAttention(nn.Module):
         self.kv_proj = nn.Conv3d(dim, dim * 2, 1)
         self.proj = nn.Conv3d(dim, dim, 1)
 
-    def forward(self, x):
+    def forward(self, x, return_attn=False):
         B, C, T, H, W = x.shape
         x_norm = self.norm(x)
 
-        # 可学习查询跨注意力
         queries = self.temporal_queries.unsqueeze(0).expand(B, -1, -1)
         q = self.q_proj(queries).view(B, self.num_queries, self.num_heads, self.head_dim)
         q = q.permute(0, 2, 1, 3)
@@ -437,7 +453,8 @@ class LongRangeTemporalAttention(nn.Module):
         out = out.mean(dim=1).unsqueeze(2).unsqueeze(3).unsqueeze(4)
         out = out.expand(-1, -1, T, H, W)
         out = self.proj(out)
-
+        if return_attn:
+            return out, attn
         return out
 
 
@@ -464,11 +481,15 @@ class LSDUNet(nn.Module):
         self.gdb = nn.ModuleList([GDB3D(model_dim) for _ in range(self.iter_num)])
         self.dst = nn.ModuleList([DSTLayer(model_dim, num_heads=num_heads) for _ in range(self.iter_num)])
 
-    def forward(self, x, return_intermediates=False, return_uncertainty=False):
+    def forward(self, x, return_intermediates=False, return_uncertainty=False,
+                return_mechanism=False):
         B, T, _, H, W = x.shape
         x_flat = x.view(B * T, 1, H, W)
 
-        y, s_dyn = self.adaptive_s(x_flat)
+        if return_mechanism:
+            y, s_dyn, basis_weights = self.adaptive_s(x_flat, return_basis_weights=True)
+        else:
+            y, s_dyn = self.adaptive_s(x_flat)
         x_r = self.R(y, s_dyn)
 
         x_r = x_r.view(B, T, 1, H, W).permute(0, 2, 1, 3, 4)
@@ -477,9 +498,14 @@ class LSDUNet(nn.Module):
 
         x_as = None
         intermediates = []
+        mech_data = {} if return_mechanism else None
         for i in range(self.iter_num):
             x, x_as = self.gdb[i](x, y, self.adaptive_s, self.R, s_dyn, x_as)
-            x = self.dst[i](x)
+            if return_mechanism:
+                x, mech = self.dst[i](x, return_mechanism=True)
+                mech_data[f'iter_{i}'] = mech
+            else:
+                x = self.dst[i](x)
             if return_intermediates:
                 x_proj = self.proj_out(x)
                 x_img = x_proj.permute(0, 2, 1, 3, 4)
@@ -487,6 +513,13 @@ class LSDUNet(nn.Module):
 
         x_mean = self.proj_out(x)
         x_mean = x_mean.permute(0, 2, 1, 3, 4)
+
+        if return_mechanism:
+            result = {
+                'basis_weights': basis_weights.detach().cpu(),  # [B*T, K]
+                'iter_data': mech_data,
+            }
+            return x_mean, result
 
         if return_uncertainty:
             log_var = self.proj_var(x)

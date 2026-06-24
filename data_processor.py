@@ -197,7 +197,7 @@ def data_loader_3d(args, root='./',
                    val_dir=None,
                    train_split=None,
                    val_split=None):
-    kwopt = {'num_workers': 8, 'pin_memory': True, 'prefetch_factor': 4, 'persistent_workers': True}
+    kwopt = {'num_workers': 4, 'pin_memory': True, 'prefetch_factor': 2}
     w_size, h_size = int(16 * 8), int(16 * 8)
     num_frames = getattr(args, 'num_frames', 8)
 

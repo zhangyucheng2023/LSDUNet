@@ -3,7 +3,9 @@ from utils import *
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
 from scipy.ndimage import laplace as _laplacian
-from torch.amp import autocast, GradScaler
+from torch.amp import autocast
+from torch.utils.checkpoint import checkpoint as _checkpoint
+from contextlib import nullcontext
 from tqdm import tqdm
 from metrics import compute_roi_mask
 
@@ -41,50 +43,119 @@ def compute_lpips_batch(pred, target):
         return _lpips_model(pred_t, target_t).mean().item()
 
 
-def train_3d(train_loader, model, criterion, optimizer, device, grad_clip=1.0, use_nll=True, beta_nll=0.5):
+def train_3d(train_loader, model, criterion, optimizer, device, grad_clip=1.0, use_nll=True, beta_nll=0.5, grad_accum=1, use_ckpt=True):
     model.train()
     sum_loss = 0
-    use_amp = (device.type == 'cuda')
-    scaler = GradScaler(device.type) if use_amp else None
-    pbar = tqdm(train_loader, desc='train', dynamic_ncols=True)
+    accum_count = 0
 
+    # Auto mixed precision: Blackwell (sm_120) → bf16, older → fp16 with GradScaler
+    use_amp = (device.type == 'cuda')
+    amp_dtype = None
+    scaler = None
+    if use_amp:
+        major = torch.cuda.get_device_capability(device)[0]
+        if major >= 12:
+            amp_dtype = torch.bfloat16  # bf16: no GradScaler needed
+        else:
+            from torch.amp import GradScaler
+            scaler = GradScaler(device.type)  # fp16: needs GradScaler
+
+    use_ckpt = use_ckpt and (device.type == 'cuda')
+
+    def _ckpt_iter(gdb, dst, x, y, adaptive_s, R, s_dyn, x_as, _amp_dtype, _device):
+        """Checkpointed iteration block. Inputs are already cast to target dtype
+        before entering checkpoint, so checkpoint saves bf16 tensors (not fp32)."""
+        if _amp_dtype is not None:
+            with autocast(_device.type, dtype=_amp_dtype):
+                x, x_as = gdb(x, y, adaptive_s, R, s_dyn, x_as)
+                x = dst(x)
+        else:
+            x, x_as = gdb(x, y, adaptive_s, R, s_dyn, x_as)
+            x = dst(x)
+        return x, x_as
+
+    def _forward(inputs):
+        nonlocal scaler
+        y, s_dyn = model.adaptive_s(inputs.view(-1, 1, *inputs.shape[-2:]))
+        x_r = model.R(y, s_dyn)
+        x_r = x_r.view(inputs.shape[0], inputs.shape[1], 1, *inputs.shape[-2:])
+        x_r = x_r.permute(0, 2, 1, 3, 4)
+        x = model.tokenizer(x_r)
+        x_as = None
+        for i in range(model.iter_num):
+            if use_ckpt and x.requires_grad:
+                # Cast to bf16 BEFORE checkpoint so checkpoint saves bf16 (288MB)
+                # instead of fp32 (576MB), cutting saved memory by ~50%.
+                if amp_dtype is not None:
+                    x_ckpt = x.to(dtype=amp_dtype)
+                    y_ckpt = y.to(dtype=amp_dtype)
+                    s_ckpt = s_dyn.to(dtype=amp_dtype)
+                    xa_ckpt = [a.to(dtype=amp_dtype) for a in x_as] if x_as is not None else None
+                else:
+                    x_ckpt, y_ckpt, s_ckpt, xa_ckpt = x, y, s_dyn, x_as
+                x, x_as = _checkpoint(
+                    _ckpt_iter,
+                    model.gdb[i], model.dst[i],
+                    x_ckpt, y_ckpt, model.adaptive_s, model.R, s_ckpt, xa_ckpt,
+                    amp_dtype, device,
+                    use_reentrant=False)
+            else:
+                if amp_dtype is not None:
+                    with autocast(device.type, dtype=amp_dtype):
+                        x, x_as = model.gdb[i](x, y, model.adaptive_s, model.R, s_dyn, x_as)
+                        x = model.dst[i](x)
+                elif scaler is not None:
+                    with autocast(device.type):
+                        x, x_as = model.gdb[i](x, y, model.adaptive_s, model.R, s_dyn, x_as)
+                        x = model.dst[i](x)
+                else:
+                    x, x_as = model.gdb[i](x, y, model.adaptive_s, model.R, s_dyn, x_as)
+                    x = model.dst[i](x)
+        x_mean = model.proj_out(x).permute(0, 2, 1, 3, 4)
+        if use_nll:
+            log_var = model.proj_var(x).clamp(-10, 10).permute(0, 2, 1, 3, 4)
+            loss = criterion(x_mean, y_ch, log_var, beta=beta_nll)
+        else:
+            loss = criterion(x_mean, y_ch)
+        loss = loss + 0.01 * model.adaptive_s.ortho_loss()
+        return loss / grad_accum
+
+    pbar = tqdm(train_loader, desc='train', dynamic_ncols=True)
     for inputs, _ in pbar:
         inputs = inputs.to(device)
-        B, T, C, H, W = inputs.shape  # [B, T, 1, H, W]
         y_ch = inputs
-        optimizer.zero_grad()
 
-        if use_amp:
+        if amp_dtype is not None:
+            with autocast(device.type, dtype=amp_dtype):
+                loss = _forward(inputs)
+        elif scaler is not None:
             with autocast(device.type):
-                if use_nll:
-                    mean, log_var = model(y_ch, return_uncertainty=True)
-                    log_var = torch.clamp(log_var, min=-10, max=10)
-                    loss = criterion(mean, y_ch, log_var, beta=beta_nll)
-                else:
-                    outputs = model(y_ch)
-                    loss = criterion(outputs, y_ch)
-                loss = loss + 0.01 * model.adaptive_s.ortho_loss()
-            scaler.scale(loss).backward()
-            if grad_clip > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+                loss = _forward(inputs)
         else:
-            if use_nll:
-                mean, log_var = model(y_ch, return_uncertainty=True)
-                loss = criterion(mean, y_ch, log_var, beta=beta_nll)
-            else:
-                outputs = model(y_ch)
-                loss = criterion(outputs, y_ch)
-            loss = loss + 0.01 * model.adaptive_s.ortho_loss()
-            loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            loss = _forward(inputs)
 
-        sum_loss += loss.item()
-        pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            torch.cuda.empty_cache()
+            loss.backward()
+
+        accum_count += 1
+        if accum_count % grad_accum == 0:
+            if scaler is not None:
+                if grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+            optimizer.zero_grad()
+
+        sum_loss += loss.item() * grad_accum
+        pbar.set_postfix({'loss': f'{loss.item() * grad_accum:.6f}'})
 
     return sum_loss / len(train_loader)
 
@@ -101,15 +172,32 @@ def valid_3d(val_loader, model, device):
     total_mse = 0.0
     total_pixels = 0
 
+    # Inference: use bf16 on Blackwell, fp16 on older GPUs
+    use_amp = (device.type == 'cuda')
+    amp_dtype = None
+    if use_amp:
+        major = torch.cuda.get_device_capability(device)[0]
+        if major >= 12:
+            amp_dtype = torch.bfloat16
+
     model.eval()
     pbar = tqdm(val_loader, desc='valid', dynamic_ncols=True)
     with torch.no_grad():
         for _, (inputs, _) in enumerate(pbar):
             inputs = inputs.to(device)
-            B, T, C, H, W = inputs.shape  # [B, T, 1, H, W], already [0,1] from ToTensor
+            B, T, C, H, W = inputs.shape
             y_ch = inputs
-            outputs = model(y_ch)
-            pred = outputs
+
+            if amp_dtype is not None:
+                with autocast(device.type, dtype=amp_dtype):
+                    outputs = model(y_ch)
+            elif use_amp:
+                with autocast(device.type):
+                    outputs = model(y_ch)
+            else:
+                outputs = model(y_ch)
+
+            pred = outputs.float()  # convert back to fp32 for metric computation
             target = y_ch
             mse = F.mse_loss(pred, target)
             total_mse += mse.item() * pred.numel()
