@@ -1,10 +1,8 @@
 import os
 import torch
+import torch.distributed as dist
 import numpy as np
 import random
-from math import log10, exp
-import torch.nn.functional as F
-from skimage.metrics import structural_similarity as ssim_count
 
 # ─── Device ───
 def _get_device(device_id="cuda:0"):
@@ -12,15 +10,39 @@ def _get_device(device_id="cuda:0"):
         try:
             d = torch.device(device_id)
             t = torch.zeros(2).to(d)
-            t = t + 1  # 执行实际运算，验证 kernel 可用
+            t = t + 1
             return d
         except Exception:
             pass
     return torch.device("cpu")
 
-device = _get_device("cuda:0")
-test_device = _get_device("cuda:0")
-print(f"[Device] Using: {device}")
+
+def ddp_setup():
+    """Initialize DDP process group. Returns local_rank and world_size."""
+    dist.init_process_group(backend='nccl')
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    torch.cuda.set_device(local_rank)
+    return local_rank, world_size
+
+
+def is_main_process():
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def init_device():
+    """Initialize device after DDP setup (if any)."""
+    if dist.is_initialized():
+        local_rank = dist.get_rank()
+        d = torch.device(f'cuda:{local_rank}')
+    else:
+        d = _get_device("cuda:0")
+    if is_main_process():
+        print(f"[Device] Using: {d}")
+    return d
+
+device = None
+test_device = None
 
 def setup_seed(seed):
     random.seed(seed)
@@ -33,17 +55,4 @@ def setup_seed(seed):
         torch.backends.cudnn.benchmark = True
 
 
-def gaussian(window_size, sigma):
-    gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
-    return gauss / gauss.sum()
 
-
-def create_window(window_size, channel=1):
-    _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
-    _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
-    window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
-    return window
-
-
-def ssim(img1, img2):
-    return ssim_count(img1.squeeze().cpu().numpy(), img2.squeeze().cpu().numpy(), data_range=1)

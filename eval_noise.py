@@ -25,7 +25,7 @@ def add_gaussian_noise(images, sigma, seed=42):
 
 class LinearTokenizer(nn.Module):
     """Ablation: pure 1x1x1 conv projection, no edge enhancement."""
-    def __init__(self, in_ch=1, dim=16):
+    def __init__(self, in_ch=3, dim=16):
         super().__init__()
         self.proj = nn.Conv3d(in_ch, dim, kernel_size=1)
 
@@ -48,7 +48,7 @@ def eval_noise_robustness(frame_paths, model, device, sigma):
 
     clean_preds = []
     noisy_preds = []
-    clean_targets = [f.squeeze(0).cpu().numpy() for f in frame_buffer]
+    clean_targets = [f.permute(1, 2, 0).cpu().numpy() for f in frame_buffer]
 
     for i in range(n_frames):
         clean_clip = clips[i]
@@ -58,8 +58,8 @@ def eval_noise_robustness(frame_paths, model, device, sigma):
             out_clean = model(clean_clip.to(device))
             out_noisy = model(noisy_clip.to(device))
 
-        clean_pred = out_clean[0, T_clip // 2, 0, :, :].cpu().numpy()
-        noisy_pred = out_noisy[0, T_clip // 2, 0, :, :].cpu().numpy()
+        clean_pred = out_clean[0, T_clip // 2].permute(1, 2, 0).cpu().numpy()
+        noisy_pred = out_noisy[0, T_clip // 2].permute(1, 2, 0).cpu().numpy()
         clean_preds.append(clean_pred)
         noisy_preds.append(noisy_pred)
 
@@ -209,7 +209,7 @@ def main():
             if mode == 'LinearTokenizer':
                 # 消融: 用 LinearTokenizer 替换 ConvTokenizer3D
                 base_model, device = load_3d_model(ratio, ckpt)
-                base_model.tokenizer = LinearTokenizer(in_ch=1,
+                base_model.tokenizer = LinearTokenizer(in_ch=3,
                                                        dim=base_model.model_dim)
                 model = base_model.to(device)
                 model.eval()

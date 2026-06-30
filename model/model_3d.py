@@ -47,7 +47,7 @@ class FFN3D(nn.Module):
 
 class ConvTokenizer3D(nn.Module):
     """3D conv tokenizer with edge branch, GroupNorm for domain invariance."""
-    def __init__(self, in_ch=1, dim=16):
+    def __init__(self, in_ch=3, dim=16):
         super().__init__()
         self.stem1 = nn.Sequential(
             nn.Conv3d(in_ch, dim // 4, kernel_size=(3, 5, 5),
@@ -231,10 +231,11 @@ class DSTLayer(nn.Module):
 
 
 class GRAD3D(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, in_ch=3):
         super().__init__()
-        self.conv2p = nn.Conv3d(dim, 1, kernel_size=1)
-        self.conv2f = nn.Conv3d(1, dim, kernel_size=1)
+        self.in_ch = in_ch
+        self.conv2p = nn.Conv3d(dim, in_ch, kernel_size=1)
+        self.conv2f = nn.Conv3d(in_ch, dim, kernel_size=1)
         self.res = nn.Sequential(
             nn.Conv3d(dim, dim, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
             nn.GELU(),
@@ -243,13 +244,13 @@ class GRAD3D(nn.Module):
 
     def forward(self, x, y, S, R, s_dyn):
         B, _, T, H, W = x.shape
-        x_proj = self.conv2p(x)
-        x_proj_flat = x_proj.permute(0, 2, 1, 3, 4).reshape(B * T, 1, H, W)
-        y_flat = y.view(B * T, *y.shape[-3:])
+        x_proj = self.conv2p(x)  # [B, in_ch, T, H, W]
+        x_proj_flat = x_proj.permute(0, 2, 1, 3, 4).reshape(B * T * self.in_ch, 1, H, W)
+        y_flat = y.view(B * T * self.in_ch, *y.shape[-3:])
         y_proj, _ = S(x_proj_flat, s_fixed=s_dyn)
         err = y_flat - y_proj
         de_flat = R(err, s_dyn)
-        De = de_flat.view(B, T, *de_flat.shape[-3:]).permute(0, 2, 1, 3, 4)
+        De = de_flat.view(B, T, self.in_ch, H, W).permute(0, 2, 1, 3, 4)
         De = self.conv2f(De)
         De = De + self.res(De)
         x = x + De
@@ -317,9 +318,9 @@ class DENO3D(nn.Module):
 
 
 class GDB3D(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, in_ch=3):
         super().__init__()
-        self.grad = GRAD3D(dim)
+        self.grad = GRAD3D(dim, in_ch=in_ch)
         self.deno = DENO3D(dim)
 
     def forward(self, x, y, S, R, s_dyn, x_as_old):
@@ -459,32 +460,32 @@ class LongRangeTemporalAttention(nn.Module):
 
 
 class LSDUNet(nn.Module):
-    """Deep unfolding CS reconstruction with multi-basis sampling, 3D conv tokenizer, DST attention and uncertainty prediction."""
-    def __init__(self, ratio, iter_num=8, model_dim=64, patch=32, num_heads=8):
+    """Deep unfolding CS reconstruction with multi-basis sampling, 3D conv tokenizer and DST attention."""
+    def __init__(self, ratio, iter_num=8, model_dim=64, patch=32, num_heads=8, in_ch=3):
         super().__init__()
 
         self.model_dim = model_dim
         self.iter_num = iter_num
         self.patch = patch
         self.num_heads = num_heads
+        self.in_ch = in_ch
         self.full_dim = patch ** 2
         self.cs_dim = int(ratio * self.full_dim)
 
         self.adaptive_s = AdaptiveSModule(self.patch, self.cs_dim)
         self.R = RModule(self.patch)
 
-        self.tokenizer = ConvTokenizer3D(in_ch=1, dim=self.model_dim)
+        self.tokenizer = ConvTokenizer3D(in_ch=in_ch, dim=self.model_dim)
 
-        self.proj_out = nn.Conv3d(self.model_dim, 1, kernel_size=1)
-        self.proj_var = nn.Conv3d(self.model_dim, 1, kernel_size=1)
+        self.proj_out = nn.Conv3d(self.model_dim, in_ch, kernel_size=1)
 
-        self.gdb = nn.ModuleList([GDB3D(model_dim) for _ in range(self.iter_num)])
+        self.gdb = nn.ModuleList([GDB3D(model_dim, in_ch=in_ch) for _ in range(self.iter_num)])
         self.dst = nn.ModuleList([DSTLayer(model_dim, num_heads=num_heads) for _ in range(self.iter_num)])
 
-    def forward(self, x, return_intermediates=False, return_uncertainty=False,
+    def forward(self, x, return_intermediates=False,
                 return_mechanism=False):
-        B, T, _, H, W = x.shape
-        x_flat = x.view(B * T, 1, H, W)
+        B, T, C, H, W = x.shape
+        x_flat = x.view(B * T * C, 1, H, W)
 
         if return_mechanism:
             y, s_dyn, basis_weights = self.adaptive_s(x_flat, return_basis_weights=True)
@@ -492,7 +493,7 @@ class LSDUNet(nn.Module):
             y, s_dyn = self.adaptive_s(x_flat)
         x_r = self.R(y, s_dyn)
 
-        x_r = x_r.view(B, T, 1, H, W).permute(0, 2, 1, 3, 4)
+        x_r = x_r.view(B, T, C, H, W).permute(0, 2, 1, 3, 4)
 
         x = self.tokenizer(x_r)
 
@@ -520,14 +521,6 @@ class LSDUNet(nn.Module):
                 'iter_data': mech_data,
             }
             return x_mean, result
-
-        if return_uncertainty:
-            log_var = self.proj_var(x)
-            log_var = torch.clamp(log_var, min=-10, max=10)
-            log_var = log_var.permute(0, 2, 1, 3, 4)
-            if return_intermediates:
-                return x_mean, log_var, intermediates
-            return x_mean, log_var
 
         if return_intermediates:
             return x_mean, intermediates

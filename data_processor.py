@@ -3,6 +3,7 @@ import os
 import re
 import torchvision
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from PIL import Image
 
 
@@ -58,7 +59,7 @@ class SequenceVolumeDataset(Dataset):
             img = Image.open(frames[start + i]).convert('RGB')
             imgs.append(img)
         if self.transform:
-            seed = torch.initial_seed()
+            seed = torch.initial_seed() + idx
             transformed = []
             for img in imgs:
                 torch.manual_seed(seed)
@@ -196,9 +197,10 @@ def data_loader_3d(args, root='./',
                    train_dir='dataset/train',
                    val_dir=None,
                    train_split=None,
-                   val_split=None):
-    kwopt = {'num_workers': 4, 'pin_memory': True, 'prefetch_factor': 2}
-    w_size, h_size = int(16 * 8), int(16 * 8)
+                   val_split=None,
+                   ddp=False):
+    kwopt = {'num_workers': 8, 'pin_memory': True, 'prefetch_factor': 4, 'persistent_workers': True}
+    w_size, h_size = int(16 * 16), int(16 * 16)
     num_frames = getattr(args, 'num_frames', 8)
 
     trn_transforms = torchvision.transforms.Compose([
@@ -206,14 +208,12 @@ def data_loader_3d(args, root='./',
         torchvision.transforms.RandomCrop(args.image_size),
         torchvision.transforms.RandomHorizontalFlip(),
         torchvision.transforms.RandomVerticalFlip(),
-        torchvision.transforms.Grayscale(num_output_channels=1),
         torchvision.transforms.ToTensor(),
     ])
 
     val_transforms = torchvision.transforms.Compose([
         torchvision.transforms.Resize((w_size, h_size)),
         torchvision.transforms.CenterCrop(args.image_size),
-        torchvision.transforms.Grayscale(num_output_channels=1),
         torchvision.transforms.ToTensor(),
     ])
 
@@ -246,12 +246,26 @@ def data_loader_3d(args, root='./',
 
     trn_dataset = SequenceVolumeDataset(train_seqs, num_frames=num_frames,
                                          transform=trn_transforms)
-    trn_loader = DataLoader(trn_dataset, batch_size=args.batch_size, shuffle=True, **kwopt,
-                            drop_last=False)
+
+    train_sampler = None
+    if ddp:
+        train_sampler = DistributedSampler(trn_dataset, shuffle=True)
+        trn_loader = DataLoader(trn_dataset, batch_size=args.batch_size,
+                                sampler=train_sampler, **kwopt, drop_last=False)
+    else:
+        trn_loader = DataLoader(trn_dataset, batch_size=args.batch_size, shuffle=True, **kwopt,
+                                drop_last=False)
 
     val_dataset = SequenceVolumeDataset(val_seqs, num_frames=num_frames,
                                          transform=val_transforms)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, **kwopt,
-                            drop_last=False)
 
-    return trn_loader, val_loader
+    val_sampler = None
+    if ddp:
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                                sampler=val_sampler, **kwopt, drop_last=False)
+    else:
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, **kwopt,
+                                drop_last=False)
+
+    return trn_loader, val_loader, train_sampler, val_sampler

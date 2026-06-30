@@ -52,18 +52,18 @@ def load_3d_model(cs_ratio, checkpoint_path, iter_num=8, model_dim=64, patch=32,
 
 
 def _load_frame(path):
-    """加载单帧并转为灰度归一化 tensor [1, H, W]"""
-    img = Image.open(path).convert('L')
+    """加载单帧并转为 RGB 归一化 tensor [3, H, W]"""
+    img = Image.open(path).convert('RGB')
     img_t = transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.CenterCrop(96),
+        transforms.Resize((256, 256)),
+        transforms.CenterCrop(224),
         transforms.ToTensor(),
-    ])(img)                                              # [1, H, W], already [0,1]
+    ])(img)                                              # [3, H, W], already [0,1]
     return img_t
 
 
 def _build_temporal_clip(frame_buffer, center_idx, clip_len=8):
-    """Build [clip_len, 1, H, W] clip centered at center_idx, with edge replication."""
+    """Build [clip_len, 3, H, W] clip centered at center_idx, with edge replication."""
     n = len(frame_buffer)
     half = clip_len // 2
     indices = []
@@ -75,8 +75,7 @@ def _build_temporal_clip(frame_buffer, center_idx, clip_len=8):
     return clip, indices
 
 
-def eval_3d_temporal(frame_paths, model, device, return_intermediates=False,
-                      return_uncertainty=False):
+def eval_3d_temporal(frame_paths, model, device, return_intermediates=False):
     """Sliding window evaluation with T_clip=8."""
     T_clip = 8
     n_frames = len(frame_paths)
@@ -84,70 +83,25 @@ def eval_3d_temporal(frame_paths, model, device, return_intermediates=False,
 
     preds = []
     all_intermediates = []
-    log_vars = [] if return_uncertainty else None
 
     for i in range(n_frames):
         clip, _ = _build_temporal_clip(frame_buffer, i, T_clip)
         with torch.no_grad():
             if return_intermediates:
                 out, intermediates = model(clip.to(device), return_intermediates=True)
-                inter_preds = [im[0, T_clip // 2, 0, :, :].cpu().numpy() for im in intermediates]
+                inter_preds = [im[0, T_clip // 2].permute(1, 2, 0).cpu().numpy() for im in intermediates]
                 all_intermediates.append(inter_preds)
-            elif return_uncertainty:
-                out, log_var = model(clip.to(device), return_uncertainty=True)
-                log_vars.append(log_var[0, T_clip // 2, 0, :, :].cpu().numpy())
             else:
                 out = model(clip.to(device))
-        pred = out[0, T_clip // 2, 0, :, :].cpu().numpy()
+        pred = out[0, T_clip // 2].permute(1, 2, 0).cpu().numpy()
         preds.append(pred)
 
-    targets = [f.squeeze(0).cpu().numpy() for f in frame_buffer]
+    targets = [f.permute(1, 2, 0).cpu().numpy() for f in frame_buffer]
 
     if return_intermediates:
         return preds, targets, all_intermediates
-    if return_uncertainty:
-        return preds, targets, log_vars
     return preds, targets
 
-
-def save_uncertainty_heatmaps(preds, targets, log_vars, seq_name, out_dir, n_samples=5):
-    """Save uncertainty heatmap visualization."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    n = min(n_samples, len(preds))
-    fig, axes = plt.subplots(n, 3, figsize=(12, 4 * n))
-    if n == 1:
-        axes = axes.reshape(1, -1)
-
-    for i in range(n):
-        target = targets[i]
-        pred = preds[i]
-        log_var = log_vars[i]
-        std = np.exp(log_var / 2)  # σ = exp(log_var/2)
-
-        # 目标帧（Ground Truth）
-        axes[i, 0].imshow(target, cmap='gray', vmin=0, vmax=1)
-        axes[i, 0].set_title(f'Target (Frame {i})')
-        axes[i, 0].axis('off')
-
-        # 重建帧
-        axes[i, 1].imshow(pred, cmap='gray', vmin=0, vmax=1)
-        axes[i, 1].set_title(f'Reconstruction')
-        axes[i, 1].axis('off')
-
-        # 不确定性热力图
-        im = axes[i, 2].imshow(std, cmap='hot', vmin=0, vmax=std.max())
-        axes[i, 2].set_title(f'Uncertainty σ')
-        axes[i, 2].axis('off')
-        plt.colorbar(im, ax=axes[i, 2], fraction=0.046)
-
-    plt.tight_layout()
-    save_path = os.path.join(out_dir, f'uncertainty_{seq_name}.png')
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f'  [uncertainty] Saved heatmap: {save_path}')
 
 
 # ─── 列名定义 ───
@@ -310,10 +264,6 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--save_uncertainty', action='store_true',
-                        help='Generate uncertainty heatmaps (β-σ) after evaluation')
-    parser.add_argument('--uncertainty_ratio', default=0.10, type=float,
-                        help='Which CS ratio to use for uncertainty viz (default: 0.10)')
     args = parser.parse_args()
 
     cs_ratios = [0.01, 0.04, 0.10, 0.25, 0.50]
@@ -500,7 +450,7 @@ if __name__ == "__main__":
                     heightmap = (heightmap - h_min) / (h_max - h_min)
                 else:
                     heightmap = np.zeros_like(heightmap)
-                heightmap = transforms.Resize((96, 96))(
+                heightmap = transforms.Resize((224, 224))(
                     torch.from_numpy(heightmap).unsqueeze(0)
                 ).squeeze().numpy()
 
@@ -609,54 +559,3 @@ if __name__ == "__main__":
 
     summary_csv.close()
     print(f"\nCross-ratio summary saved to: ./eval_results/summary_all_ratios.csv")
-
-    # ═══════════════════════════════════════════════════════════════
-    # 不确定性可视化（独立于主评估，仅生成热力图）
-    # ═══════════════════════════════════════════════════════════════
-    if args.save_uncertainty:
-        print("\n" + "=" * 100)
-        print("=== Uncertainty Visualization (β-NLL Heteroscedastic) ===")
-        print("=" * 100)
-
-        ckpt = f'./trained_model/lsdunet_{args.uncertainty_ratio}.pth'
-        if not os.path.exists(ckpt):
-            print(f"[SKIP] Checkpoint not found: {ckpt}")
-        else:
-            model, device = load_3d_model(args.uncertainty_ratio, ckpt)
-            unc_dir = f'./eval_results/uncertainty'
-            os.makedirs(unc_dir, exist_ok=True)
-
-            # 选取代表性序列：Touch and Go (跨域时序), TacQuad (自参考), Yuan18 (布料)
-            sample_sources = {}
-
-            # Touch and Go: 取前 3 个序列
-            if tag_test_seqs:
-                for i, (seq_dir, frames) in enumerate(sorted(tag_test_seqs.items())[:3]):
-                    sample_sources[f'Tag_{os.path.basename(seq_dir)}'] = frames
-
-            # TacQuad: 取第一个物体
-            if tactile_objs:
-                first_obj = sorted(tactile_objs.keys())[0]
-                sample_sources[f'TacQuad_{first_obj}'] = tactile_objs[first_obj]
-
-            # Yuan18: 取前 2 个序列
-            if yuan18_test_seqs:
-                for i, (seq_dir, frames) in enumerate(sorted(yuan18_test_seqs.items())[:2]):
-                    sample_sources[f'Yuan18_{os.path.basename(seq_dir)}'] = frames
-
-            for name, frames in sample_sources.items():
-                if len(frames) < 8:
-                    continue
-                print(f"\nGenerating uncertainty heatmap for: {name} ({len(frames)} frames)...")
-                preds, targets, log_vars = eval_3d_temporal(
-                    frames, model, device, return_uncertainty=True)
-
-                # 保存 log_var 原始数据
-                np.save(os.path.join(unc_dir, f'{name}_preds.npy'), np.array(preds))
-                np.save(os.path.join(unc_dir, f'{name}_targets.npy'), np.array(targets))
-                np.save(os.path.join(unc_dir, f'{name}_logvars.npy'), np.array(log_vars))
-
-                # 自动生成热力图
-                save_uncertainty_heatmaps(preds, targets, log_vars, name, unc_dir)
-
-            print(f"\nUncertainty results saved to: {unc_dir}/")

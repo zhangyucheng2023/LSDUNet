@@ -41,6 +41,8 @@ def compute_psnr(pred, target, data_range=1.0):
 def compute_ssim(pred, target, data_range=1.0):
     pred = np.clip(pred, 0, data_range)
     target = np.clip(target, 0, data_range)
+    if pred.ndim == 3:
+        return _ssim(target, pred, data_range=data_range, channel_axis=-1)
     return _ssim(target, pred, data_range=data_range)
 
 
@@ -49,18 +51,26 @@ def compute_ssim(pred, target, data_range=1.0):
 # ═══════════════════════════════════════════════════════════
 
 def compute_lpips(pred, target):
-    """LPIPS perceptual similarity. Requires: pip install lpips."""
+    """LPIPS perceptual similarity. Requires: pip install lpips.
+    pred/target: [H, W] grayscale or [H, W, 3] RGB."""
     lpips_fn = _get_lpips()
     if lpips_fn is False:
         return None
     import torch
-    pred_t = torch.from_numpy(pred).float().unsqueeze(0).unsqueeze(0)
-    target_t = torch.from_numpy(target).float().unsqueeze(0).unsqueeze(0)
+    if pred.ndim == 3:
+        pred_t = torch.from_numpy(pred).float().permute(2, 0, 1).unsqueeze(0)
+        target_t = torch.from_numpy(target).float().permute(2, 0, 1).unsqueeze(0)
+    else:
+        pred_t = torch.from_numpy(pred).float().unsqueeze(0).unsqueeze(0)
+        target_t = torch.from_numpy(target).float().unsqueeze(0).unsqueeze(0)
     if pred_t.max() > 1:
         pred_t = pred_t / 255.0
         target_t = target_t / 255.0
-    pred_t = pred_t.repeat(1, 3, 1, 1).to(next(lpips_fn.parameters()).device)
-    target_t = target_t.repeat(1, 3, 1, 1).to(next(lpips_fn.parameters()).device)
+    if pred_t.shape[1] == 1:
+        pred_t = pred_t.repeat(1, 3, 1, 1)
+        target_t = target_t.repeat(1, 3, 1, 1)
+    pred_t = pred_t.to(next(lpips_fn.parameters()).device)
+    target_t = target_t.to(next(lpips_fn.parameters()).device)
     with torch.no_grad():
         score = lpips_fn(pred_t, target_t).item()
     return score
@@ -71,15 +81,23 @@ def compute_lpips(pred, target):
 # ═══════════════════════════════════════════════════════════
 
 def compute_roi_mask(img, method='otsu', threshold=None):
-    """Binary contact region mask via Otsu thresholding."""
+    """Binary contact region mask via Otsu thresholding.
+    Accepts [H, W] grayscale or [H, W, C] multi-channel (uses luminance)."""
+    if img.ndim == 3:
+        img = img.mean(axis=-1)
     img_clipped = np.clip(img, 0, 1).astype(np.float64)
 
     if method == 'otsu':
         img_uint8 = (img_clipped * 255).astype(np.uint8)
-        thresh = threshold_otsu(img_uint8)
-        mask = (img_uint8 > thresh).astype(np.float32)
-        mask = ndimage.binary_opening(mask, structure=np.ones((3, 3))).astype(np.float32)
-        mask = ndimage.binary_closing(mask, structure=np.ones((5, 5))).astype(np.float32)
+        try:
+            thresh = threshold_otsu(img_uint8)
+            mask = (img_uint8 > thresh).astype(np.float32)
+            mask = ndimage.binary_opening(mask, structure=np.ones((3, 3))).astype(np.float32)
+            mask = ndimage.binary_closing(mask, structure=np.ones((5, 5))).astype(np.float32)
+        except ValueError:
+            # All pixel values are identical (e.g., no-contact frame) — fallback to threshold
+            threshold = float(img_clipped.mean())
+            mask = (img_clipped > threshold).astype(np.float32)
     elif method == 'threshold':
         if threshold is None:
             threshold = np.mean(img_clipped) + 0.3 * np.std(img_clipped)
@@ -97,13 +115,17 @@ def compute_roi_mask(img, method='otsu', threshold=None):
 
 
 def compute_roi_psnr(pred, target, mask=None, data_range=1.0):
-    """PSNR over contact region only."""
+    """PSNR over contact region only. Handles [H, W] or [H, W, C]."""
     if mask is None:
         mask = compute_roi_mask(target)
     if mask.sum() < 1:
         return 0.0
-    pred_roi = pred[mask > 0.5]
-    target_roi = target[mask > 0.5]
+    if pred.ndim == 3:
+        mask_b = mask[..., None]
+    else:
+        mask_b = mask
+    pred_roi = pred[mask_b > 0.5]
+    target_roi = target[mask_b > 0.5]
     if len(pred_roi) == 0:
         return 0.0
     mse = np.mean((pred_roi - target_roi) ** 2)
@@ -113,13 +135,19 @@ def compute_roi_psnr(pred, target, mask=None, data_range=1.0):
 
 
 def compute_roi_ssim(pred, target, mask=None, data_range=1.0):
-    """SSIM over contact region only."""
+    """SSIM over contact region only. Handles [H, W] or [H, W, C]."""
     if mask is None:
         mask = compute_roi_mask(target)
     if mask.sum() < 1:
         return 0.0
-    pred_masked = pred * mask + target * (1 - mask)
-    target_masked = target * mask + target * (1 - mask)
+    if pred.ndim == 3:
+        mask_b = mask[..., None]
+    else:
+        mask_b = mask
+    pred_masked = pred * mask_b + target * (1 - mask_b)
+    target_masked = target * mask_b + target * (1 - mask_b)
+    if pred.ndim == 3:
+        return _ssim(target_masked, pred_masked, data_range=data_range, channel_axis=-1)
     return _ssim(target_masked, pred_masked, data_range=data_range)
 
 
@@ -133,6 +161,14 @@ def evaluate_all(pred, target):
         pred = pred / 255.0
     if target.max() > 1.5:
         target = target / 255.0
+
+    # Dimension mismatch (e.g., RGB pred vs grayscale heightmap GT):
+    # convert both to luminance so all metric functions receive matching shapes.
+    if pred.ndim != target.ndim:
+        if pred.ndim == 3:
+            pred = pred.mean(axis=-1)
+        if target.ndim == 3:
+            target = target.mean(axis=-1)
 
     metrics = {
         'PSNR': compute_psnr(pred, target),
@@ -157,8 +193,8 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
 
 
-def measure_flops(model, input_shape=(1, 8, 1, 96, 96), device='cpu', verbose=False):
-    """Measure FLOPs (G) using fvcore. Returns None if not installed."""
+def measure_flops(model, input_shape=(1, 8, 3, 224, 224), device='cpu', verbose=False):
+    """Measure FLOPs (G) using fvcore. Returns None if not installed or fails."""
     try:
         from fvcore.nn import FlopCountAnalysis
         import torch
@@ -166,38 +202,45 @@ def measure_flops(model, input_shape=(1, 8, 1, 96, 96), device='cpu', verbose=Fa
         x = torch.randn(*input_shape).to(device)
         flops = FlopCountAnalysis(model, x)
         return flops.total() / 1e9
-    except ImportError:
+    except Exception as e:
         if verbose:
-            print("  [info] fvcore not installed, FLOPs = N/A.  Install via: pip install fvcore")
+            print(f"  [info] FLOPs measurement failed: {e}")
         return None
 
 
-def measure_fps(model, input_shape=(1, 8, 1, 96, 96), device='cpu', warmup=10, repeats=100):
-    """Measure inference FPS (clips/sec)."""
+def measure_fps(model, input_shape=(1, 8, 3, 224, 224), device='cpu', warmup=10, repeats=100):
+    """Measure inference FPS (clips/sec). Returns 0.0 on failure."""
     import torch
     import time
-    model.eval()
-    x = torch.randn(*input_shape).to(device)
-    # warmup
-    for _ in range(warmup):
-        with torch.no_grad():
-            _ = model(x)
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    # timed runs
-    start = time.perf_counter()
-    for _ in range(repeats):
-        with torch.no_grad():
-            _ = model(x)
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
-    return repeats / elapsed
+    try:
+        model.eval()
+        x = torch.randn(*input_shape).to(device)
+        for _ in range(warmup):
+            with torch.no_grad():
+                _ = model(x)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(repeats):
+            with torch.no_grad():
+                _ = model(x)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        return repeats / elapsed
+    except Exception as e:
+        print(f"  [warn] FPS measurement failed: {e}")
+        return 0.0
 
 
 def compute_edge_psnr(pred, target, data_range=1.0):
-    """PSNR in Laplacian gradient domain for edge preservation."""
+    """PSNR in Laplacian gradient domain for edge preservation.
+    Handles [H, W] or [H, W, C] (per-channel averaged)."""
     from scipy.ndimage import laplace as _laplacian
+    if pred.ndim == 3:
+        ch_psnrs = [compute_edge_psnr(pred[..., c], target[..., c], data_range)
+                    for c in range(pred.shape[-1])]
+        return float(np.mean(ch_psnrs))
     pred_edge = _laplacian(pred.astype(np.float64))
     target_edge = _laplacian(target.astype(np.float64))
     edge_range = max(pred_edge.max() - pred_edge.min(),
@@ -209,7 +252,8 @@ def compute_edge_psnr(pred, target, data_range=1.0):
 
 
 def compute_temporal_psnr(preds, targets, data_range=1.0):
-    """PSNR of frame-to-frame differences (temporal consistency)."""
+    """PSNR of frame-to-frame differences (temporal consistency).
+    Handles [H, W] or [H, W, C] arrays."""
     if len(preds) < 2:
         return None
     pair_psnrs = []
@@ -227,7 +271,7 @@ def compute_temporal_psnr(preds, targets, data_range=1.0):
     return float(np.mean(pair_psnrs))
 
 
-def get_efficiency_metrics(model, input_shape=(1, 8, 1, 96, 96), device='cpu',
+def get_efficiency_metrics(model, input_shape=(1, 8, 3, 224, 224), device='cpu',
                            verbose=True):
     """Get Params (M), FLOPs (G), FPS."""
     params = count_parameters(model)

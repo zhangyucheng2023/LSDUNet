@@ -38,10 +38,10 @@ def load_model(cs_ratio, checkpoint_path, device='cuda:0'):
 def load_frame(path):
     from PIL import Image
     from torchvision import transforms
-    img = Image.open(path).convert('L')
+    img = Image.open(path).convert('RGB')
     t = transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.CenterCrop(96),
+        transforms.Resize((256, 256)),
+        transforms.CenterCrop(224),
         transforms.ToTensor(),
     ])(img)
     return t
@@ -55,7 +55,7 @@ def build_clip(frame_buffer, center_idx, clip_len=8):
         idx = max(0, min(n - 1, center_idx + offset))
         indices.append(idx)
     clip = torch.stack([frame_buffer[i] for i in indices], dim=0)
-    clip = clip.unsqueeze(0)  # [1, T, 1, H, W]
+    clip = clip.unsqueeze(0)  # [1, T, 3, H, W]
     return clip
 
 
@@ -79,14 +79,15 @@ def extract_sequence_mechanisms(frame_paths, model, device, out_dir):
             out, mech = model(clip.to(device), return_mechanism=True)
 
         # Centre-frame reconstruction & target
-        pred = out[0, T_clip // 2, 0, :, :].cpu().numpy()
-        target = frame_buffer[i].squeeze(0).cpu().numpy()
+        pred = out[0, T_clip // 2].permute(1, 2, 0).cpu().numpy()
+        target = frame_buffer[i].permute(1, 2, 0).cpu().numpy()
         targets_list.append(target)
         preds_list.append(pred)
 
-        # Basis weights: [B*T, K] → take centre-frame weights
-        bw = mech['basis_weights'].numpy()  # [8, K]
-        basis_all.append(bw[T_clip // 2])
+        # Basis weights: [B*T*C, K] → average centre-frame channels
+        bw = mech['basis_weights'].numpy()  # [T_clip * 3, K]
+        center_start = (T_clip // 2) * 3
+        basis_all.append(bw[center_start:center_start + 3].mean(axis=0))
 
         # Per-iteration attention data
         for iter_key in sorted(mech['iter_data'].keys(),
