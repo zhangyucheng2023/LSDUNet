@@ -131,10 +131,86 @@ def compute_lpips_batch(pred, target):
         return model(pred_t, target_t).mean().item()
 
 
+# ─── 可微损失函数 (DWT 小波 + SSIM) ───
+
+def dwt_haar_2d(x, levels=3):
+    """多级 Haar 小波分解 (可微, 纯 PyTorch).
+
+    Args:
+        x: [B, C, H, W], H/W 必须能被 2^levels 整除
+        levels: 分解级数
+
+    Returns:
+        coeffs: list of (LL, (HL, LH, HH)) per level, LL 是低频, HL/LH/HH 是高频
+    """
+    coeffs = []
+    current = x
+    for _ in range(levels):
+        a = current[:, :, 0::2, 0::2]
+        b = current[:, :, 1::2, 0::2]
+        c = current[:, :, 0::2, 1::2]
+        d = current[:, :, 1::2, 1::2]
+        ll = (a + b + c + d) / 2
+        hl = (a - b + c - d) / 2  # 水平高频
+        lh = (a + b - c - d) / 2  # 垂直高频
+        hh = (a - b - c + d) / 2  # 对角高频
+        coeffs.append((ll, (hl, lh, hh)))
+        current = ll
+    return coeffs
+
+
+def wavelet_loss(pred, target, levels=3):
+    """多级 Haar 小波 L1 损失.
+
+    替代 FFT 频率损失:
+    - 多尺度局部化 (FFT 是全局频率, 小波是局部时频)
+    - 边缘保持 (高频系数直接对应边缘)
+    - O(N) 复杂度 (FFT 是 O(N log N))
+    - 支持 bf16 (fft2 不支持)
+
+    Args:
+        pred, target: [B, C, H, W]
+    """
+    pred_coeffs = dwt_haar_2d(pred, levels)
+    tgt_coeffs = dwt_haar_2d(target, levels)
+    loss = 0.0
+    for (p_ll, (p_hl, p_lh, p_hh)), (t_ll, (t_hl, t_lh, t_hh)) in \
+            zip(pred_coeffs, tgt_coeffs):
+        loss = loss + F.l1_loss(p_ll, t_ll)
+        loss = loss + F.l1_loss(p_hl, t_hl)
+        loss = loss + F.l1_loss(p_lh, t_lh)
+        loss = loss + F.l1_loss(p_hh, t_hh)
+    return loss / levels
+
+
+def ssim_loss(pred, target, window_size=11, C1=0.01**2, C2=0.03**2):
+    """可微 SSIM 损失 (1 - SSIM).
+
+    用 avg_pool 作为窗口, 无需外部依赖.
+
+    Args:
+        pred, target: [B, C, H, W] in [0, 1]
+    """
+    pad = window_size // 2
+    mu_p = F.avg_pool2d(pred, window_size, stride=1, padding=pad)
+    mu_t = F.avg_pool2d(target, window_size, stride=1, padding=pad)
+    mu_p_sq = mu_p * mu_p
+    mu_t_sq = mu_t * mu_t
+    mu_pt = mu_p * mu_t
+
+    sigma_p_sq = F.avg_pool2d(pred * pred, window_size, stride=1, padding=pad) - mu_p_sq
+    sigma_t_sq = F.avg_pool2d(target * target, window_size, stride=1, padding=pad) - mu_t_sq
+    sigma_pt = F.avg_pool2d(pred * target, window_size, stride=1, padding=pad) - mu_pt
+
+    ssim_map = ((2 * mu_pt + C1) * (2 * sigma_pt + C2)) / \
+               ((mu_p_sq + mu_t_sq + C1) * (sigma_p_sq + sigma_t_sq + C2))
+    return 1.0 - ssim_map.mean()
+
+
 def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
              grad_accum=1,
              ddp_model=None, ema=None,
-             w_edge=0.1, w_freq=0.01, w_ortho=0.01, w_nll=0.01):
+             w_edge=0.1, w_freq=0.01, w_ortho=0.01, w_nll=0.01, w_ssim=0.1):
     """Simplified trainer for LSDUNet-Lite.
 
     No gradient checkpointing needed (lite model is memory-efficient).
@@ -142,9 +218,10 @@ def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
 
     Loss weights (parameterized for grid-search / ablation):
       w_edge: weight for Sobel edge loss
-      w_freq: weight for FFT frequency loss
+      w_freq: weight for DWT wavelet loss (replaces FFT)
       w_ortho: weight for sampling-matrix orthogonality loss
       w_nll: weight for uncertainty NLL loss
+      w_ssim: weight for differentiable SSIM loss
     """
     model.train()
     sum_loss = 0
@@ -191,11 +268,14 @@ def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
             tgt_edge_y = F.conv2d(tgt_gray, sobel_y, padding=1)
             loss_edge = F.mse_loss(pred_edge_x, tgt_edge_x) + F.mse_loss(pred_edge_y, tgt_edge_y)
 
-            # Frequency loss (FFT - preserves high-frequency tactile details)
-            # NOTE: torch.fft.fft2 does NOT support bfloat16; cast to float32 explicitly
-            pred_fft = torch.fft.fft2(outputs.float().flatten(0,1))  # [B*T, C, H, W] -> complex
-            tgt_fft = torch.fft.fft2(target.float().flatten(0,1))
-            loss_freq = (pred_fft - tgt_fft).abs().mean()
+            # Wavelet loss (DWT - multi-scale local frequency, replaces FFT)
+            # Haar 小波: 多尺度边缘保持, O(N) 复杂度, 支持 bf16 (fft2 不支持)
+            pred_2d = outputs.flatten(0, 1)  # [B*T, C, H, W]
+            tgt_2d = target.flatten(0, 1)
+            loss_freq = wavelet_loss(pred_2d, tgt_2d, levels=3)
+
+            # SSIM loss (differentiable structural similarity)
+            loss_ssim = ssim_loss(pred_2d, tgt_2d)
 
             # Uncertainty-weighted NLL loss: 0.5 * (log(σ²) + (x-μ)²/σ²)
             # Small weight to avoid destabilizing training
@@ -207,6 +287,7 @@ def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
             # NOTE: adaptive_s.ortho_loss() is on base_model; access via model.module if DDP
             ortho_model = model.module if hasattr(model, 'module') else model
             loss = loss_rec + w_edge * loss_edge + w_freq * loss_freq
+            loss = loss + w_ssim * loss_ssim
             loss = loss + w_ortho * ortho_model.adaptive_s.ortho_loss()
             loss = loss + w_nll * loss_nll
             loss = loss / grad_accum

@@ -159,6 +159,7 @@ def main(cs_ratio):
                             ddp_model=model if dist.is_initialized() else None,
                             ema=ema,
                             w_edge=args.w_edge, w_freq=args.w_freq,
+                            w_ssim=args.w_ssim,
                             w_ortho=args.w_ortho, w_nll=args.w_nll)
 
             if epoch < args.warm_epochs:
@@ -329,7 +330,8 @@ if __name__ == '__main__':
                         help='debug mode: disable EMA and other production-only features')
     # Loss weights (for grid-search / ablation study)
     parser.add_argument('--w_edge', type=float, default=0.1, help='weight for Sobel edge loss')
-    parser.add_argument('--w_freq', type=float, default=0.01, help='weight for FFT frequency loss')
+    parser.add_argument('--w_freq', type=float, default=0.01, help='weight for DWT wavelet loss')
+    parser.add_argument('--w_ssim', type=float, default=0.1, help='weight for differentiable SSIM loss')
     parser.add_argument('--w_ortho', type=float, default=0.01, help='weight for sampling-matrix orthogonality loss')
     parser.add_argument('--w_nll', type=float, default=0.01, help='weight for uncertainty NLL loss')
     args = parser.parse_args()
