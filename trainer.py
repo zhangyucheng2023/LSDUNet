@@ -3,37 +3,117 @@ import math
 from math import log10
 import torch.distributed as dist
 import torch.nn.functional as F
+from contextlib import nullcontext as _null_ctx
 
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
 from scipy.ndimage import laplace as _laplacian
 from torch.amp import autocast
-from torch.utils.checkpoint import checkpoint as _checkpoint
 from tqdm import tqdm
-from metrics import compute_roi_mask
+from metrics import compute_roi_mask, compute_ece, compute_brier_score, _get_lpips
 
-try:
-    import ssl
-    import warnings
-    _orig_context = ssl._create_default_https_context
-    ssl._create_default_https_context = ssl._create_unverified_context
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        import lpips as _lpips_lib
-        _lpips_model = _lpips_lib.LPIPS(net='alex', verbose=False)
-        if torch.cuda.is_available():
-            _lpips_model = _lpips_model.cuda()
-    ssl._create_default_https_context = _orig_context
-    HAS_LPIPS = True
-except Exception:
-    _lpips_model = None
-    HAS_LPIPS = False
+
+class EMA:
+    """Exponential Moving Average for model weights.
+
+    DDP-aware: when dist is initialized, all-reduce shadow parameters across ranks
+    so every rank keeps an identical EMA copy. This prevents EMA divergence when
+    each rank sees a different data shard.
+
+    Performance: uses a single flattened buffer for all-reduce (1 NCCL call per
+    sync instead of N per-parameter calls). For a model with ~500 params this
+    cuts sync overhead by ~500x.
+    """
+    def __init__(self, model, decay=0.999, ddp_sync=True):
+        self.decay = decay
+        self.ddp_sync = ddp_sync and dist.is_available() and dist.is_initialized()
+        self.shadow = {name: p.clone().detach() for name, p in model.named_parameters() if p.requires_grad}
+        # Build flattened buffer for efficient all-reduce (1 NCCL call vs N)
+        self._build_flat_buffer()
+        # Ensure initial shadow is identical across ranks
+        if self.ddp_sync:
+            self._sync_shadow()
+
+    def _build_flat_buffer(self):
+        """Build a single flattened buffer from all shadow params."""
+        self._flat_meta = []  # (name, offset, numel, shape)
+        offset = 0
+        for name, t in self.shadow.items():
+            numel = t.numel()
+            self._flat_meta.append((name, offset, numel, t.shape))
+            offset += numel
+        # Use device/dtype from first param (all params typically on same device)
+        sample = next(iter(self.shadow.values()))
+        self._flat_buffer = torch.zeros(offset, dtype=sample.dtype, device=sample.device)
+
+    @torch.no_grad()
+    def _sync_shadow(self):
+        """All-reduce shadow parameters to keep them identical across ranks.
+
+        Uses a single flattened all-reduce for efficiency: O(1) NCCL calls
+        instead of O(N_params).
+        """
+        if not self.ddp_sync:
+            return
+        # Copy shadow params into flat buffer
+        for name, offset, numel, _ in self._flat_meta:
+            self._flat_buffer[offset:offset + numel] = self.shadow[name].detach().reshape(-1)
+        # Single all-reduce
+        dist.all_reduce(self._flat_buffer, op=dist.ReduceOp.AVG)
+        # Copy back to shadow params
+        for name, offset, numel, shape in self._flat_meta:
+            self.shadow[name].copy_(self._flat_buffer[offset:offset + numel].view(shape))
+
+    @torch.no_grad()
+    def update(self, model):
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.shadow:
+                # p.data is already synchronized across ranks by DDP backward,
+                # so local EMA update produces identical shadow on every rank.
+                self.shadow[name].mul_(self.decay).add_(p.data, alpha=1 - self.decay)
+        # Defensive periodic sync (cheap insurance against any drift)
+        if self.ddp_sync:
+            self._sync_shadow()
+
+    @torch.no_grad()
+    def apply(self, model):
+        """Apply EMA weights to model. Call before validation."""
+        self.backup = {name: p.clone() for name, p in model.named_parameters() if p.requires_grad}
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.shadow:
+                p.data.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model):
+        """Restore original weights after validation."""
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self.backup:
+                p.data.copy_(self.backup[name])
+        self.backup = None
+
+
+# LPIPS model: use shared instance from metrics.py to avoid duplicate init
+# (metrics.py handles lazy loading + SSL workaround + GPU placement)
+_lpips_model = None  # lazily fetched on first use via _get_lpips()
+HAS_LPIPS = True  # will be set to False if _get_lpips() returns False
+
+
+def _ensure_lpips():
+    """Lazily initialize LPIPS model from metrics.py (shared singleton)."""
+    global _lpips_model, HAS_LPIPS
+    if _lpips_model is None and HAS_LPIPS:
+        _lpips_model = _get_lpips()
+        if _lpips_model is False:
+            _lpips_model = None
+            HAS_LPIPS = False
+    return _lpips_model
 
 
 def compute_lpips_batch(pred, target):
     """Compute LPIPS for a batch of 2D images.
     pred, target: [N, H, W] grayscale or [N, C, H, W] multi-channel."""
-    if not HAS_LPIPS or _lpips_model is None:
+    model = _ensure_lpips()
+    if model is None:
         return None
     if pred.dim() == 3:
         pred_t = pred.unsqueeze(1).repeat(1, 3, 1, 1)
@@ -44,118 +124,109 @@ def compute_lpips_batch(pred, target):
     if pred_t.max() > 1.5:
         pred_t = pred_t / 255.0
         target_t = target_t / 255.0
-    device = next(_lpips_model.parameters()).device
+    device = next(model.parameters()).device
     pred_t = pred_t.to(device)
     target_t = target_t.to(device)
     with torch.no_grad():
-        return _lpips_model(pred_t, target_t).mean().item()
+        return model(pred_t, target_t).mean().item()
 
 
 def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
-             grad_accum=1, use_ckpt=True,
-             ddp_model=None):
+             grad_accum=1,
+             ddp_model=None, ema=None,
+             w_edge=0.1, w_freq=0.01, w_ortho=0.01, w_nll=0.01):
+    """Simplified trainer for LSDUNet-Lite.
+
+    No gradient checkpointing needed (lite model is memory-efficient).
+    No complex AMP dtype tracking (just bfloat16 on Ampere+).
+
+    Loss weights (parameterized for grid-search / ablation):
+      w_edge: weight for Sobel edge loss
+      w_freq: weight for FFT frequency loss
+      w_ortho: weight for sampling-matrix orthogonality loss
+      w_nll: weight for uncertainty NLL loss
+    """
     model.train()
     sum_loss = 0
     accum_count = 0
 
-    # Auto mixed precision: Ampere+ (sm_80) → bf16, older → fp16 with GradScaler
+    # AMP: bfloat16 on Ampere+ (no GradScaler needed), fp16 with GradScaler on older
     use_amp = (device.type == 'cuda')
     amp_dtype = None
     scaler = None
     if use_amp:
         major = torch.cuda.get_device_capability(device)[0]
         if major >= 8:
-            amp_dtype = torch.bfloat16  # bf16: no GradScaler needed (Ampere/Ada/Blackwell)
+            amp_dtype = torch.bfloat16
         else:
             from torch.amp import GradScaler
-            scaler = GradScaler(device.type)  # fp16: needs GradScaler
-
-    use_ckpt = use_ckpt and (device.type == 'cuda')
-
-    def _ckpt_iter(gdb, dst, x, y, adaptive_s, R, s_dyn, x_as, _amp_dtype, _device):
-        """Checkpointed iteration block. Inputs are already cast to target dtype
-        before entering checkpoint, so checkpoint saves bf16 tensors (not fp32)."""
-        if _amp_dtype is not None:
-            with autocast(_device.type, dtype=_amp_dtype):
-                x, x_as = gdb(x, y, adaptive_s, R, s_dyn, x_as)
-                x = dst(x)
-        else:
-            x, x_as = gdb(x, y, adaptive_s, R, s_dyn, x_as)
-            x = dst(x)
-        return x, x_as
-
-    def _forward(inputs):
-        y, s_dyn = model.adaptive_s(inputs.view(-1, 1, *inputs.shape[-2:]))
-        x_r = model.R(y, s_dyn)
-        x_r = x_r.view(inputs.shape[0], inputs.shape[1], inputs.shape[2], *inputs.shape[-2:])
-        x_r = x_r.permute(0, 2, 1, 3, 4)
-        x = model.tokenizer(x_r)
-        x_as = None
-        for i in range(model.iter_num):
-            if use_ckpt and x.requires_grad:
-                # Cast to bf16 BEFORE checkpoint so checkpoint saves bf16 (288MB)
-                # instead of fp32 (576MB), cutting saved memory by ~50%.
-                if amp_dtype is not None:
-                    x_ckpt = x.to(dtype=amp_dtype)
-                    y_ckpt = y.to(dtype=amp_dtype)
-                    s_ckpt = s_dyn.to(dtype=amp_dtype)
-                    xa_ckpt = [a.to(dtype=amp_dtype) for a in x_as] if x_as is not None else None
-                else:
-                    x_ckpt, y_ckpt, s_ckpt, xa_ckpt = x, y, s_dyn, x_as
-                x, x_as = _checkpoint(
-                    _ckpt_iter,
-                    model.gdb[i], model.dst[i],
-                    x_ckpt, y_ckpt, model.adaptive_s, model.R, s_ckpt, xa_ckpt,
-                    amp_dtype, device,
-                    use_reentrant=False)
-            else:
-                if amp_dtype is not None:
-                    with autocast(device.type, dtype=amp_dtype):
-                        x, x_as = model.gdb[i](x, y, model.adaptive_s, model.R, s_dyn, x_as)
-                        x = model.dst[i](x)
-                elif scaler is not None:
-                    with autocast(device.type):
-                        x, x_as = model.gdb[i](x, y, model.adaptive_s, model.R, s_dyn, x_as)
-                        x = model.dst[i](x)
-                else:
-                    x, x_as = model.gdb[i](x, y, model.adaptive_s, model.R, s_dyn, x_as)
-                    x = model.dst[i](x)
-        x_mean = model.proj_out(x).permute(0, 2, 1, 3, 4)
-        loss = F.mse_loss(x_mean, y_ch)
-        loss = loss + 0.01 * model.adaptive_s.ortho_loss()
-        return loss / grad_accum
+            scaler = GradScaler(device.type)
 
     pbar = tqdm(train_loader, desc='train', dynamic_ncols=True, mininterval=0.5) if is_main_process() else train_loader
     for step_i, (inputs, _) in enumerate(pbar):
         inputs = inputs.to(device)
-        y_ch = inputs
+        # Assert expected 5D input: [B, T, C, H, W]
+        assert inputs.dim() == 5, f"Expected 5D input [B,T,C,H,W], got {inputs.dim()}D shape {inputs.shape}"
+        target = inputs
 
-        if amp_dtype is not None:
-            with autocast(device.type, dtype=amp_dtype):
-                loss = _forward(inputs)
-        elif scaler is not None:
-            with autocast(device.type):
-                loss = _forward(inputs)
-        else:
-            loss = _forward(inputs)
+        # Forward pass: use DDP-wrapped model (not base_model) so gradient sync works
+        fwd_model = ddp_model if ddp_model is not None else model
+        ctx = autocast(device.type, dtype=amp_dtype) if amp_dtype else (
+            autocast(device.type) if scaler else _null_ctx())
+        with ctx:
+            outputs, uncertainty = fwd_model(inputs, return_uncertainty=True)
+
+            # Reconstruction loss (MSE)
+            loss_rec = F.mse_loss(outputs, target)
+
+            # Edge loss (Sobel filter - preserves tactile edges)
+            # outputs: [B, T, C, H, W] -> grayscale [B*T, 1, H, W]
+            pred_gray = outputs.mean(dim=2).reshape(-1, 1, *outputs.shape[-2:])
+            tgt_gray = target.mean(dim=2).reshape(-1, 1, *target.shape[-2:])
+            sobel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=outputs.dtype, device=outputs.device).view(1,1,3,3)
+            sobel_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=outputs.dtype, device=outputs.device).view(1,1,3,3)
+            pred_edge_x = F.conv2d(pred_gray, sobel_x, padding=1)
+            pred_edge_y = F.conv2d(pred_gray, sobel_y, padding=1)
+            tgt_edge_x = F.conv2d(tgt_gray, sobel_x, padding=1)
+            tgt_edge_y = F.conv2d(tgt_gray, sobel_y, padding=1)
+            loss_edge = F.mse_loss(pred_edge_x, tgt_edge_x) + F.mse_loss(pred_edge_y, tgt_edge_y)
+
+            # Frequency loss (FFT - preserves high-frequency tactile details)
+            # NOTE: torch.fft.fft2 does NOT support bfloat16; cast to float32 explicitly
+            pred_fft = torch.fft.fft2(outputs.float().flatten(0,1))  # [B*T, C, H, W] -> complex
+            tgt_fft = torch.fft.fft2(target.float().flatten(0,1))
+            loss_freq = (pred_fft - tgt_fft).abs().mean()
+
+            # Uncertainty-weighted NLL loss: 0.5 * (log(σ²) + (x-μ)²/σ²)
+            # Small weight to avoid destabilizing training
+            var = uncertainty.float()  # [B, T, 1, H, W]
+            sq_err = (outputs.float() - target.float()).pow(2).mean(dim=2, keepdim=True)  # [B, T, 1, H, W]
+            loss_nll = 0.5 * (torch.log(var) + sq_err / var).mean()
+
+            # Total loss (parameterized weights for grid-search)
+            # NOTE: adaptive_s.ortho_loss() is on base_model; access via model.module if DDP
+            ortho_model = model.module if hasattr(model, 'module') else model
+            loss = loss_rec + w_edge * loss_edge + w_freq * loss_freq
+            loss = loss + w_ortho * ortho_model.adaptive_s.ortho_loss()
+            loss = loss + w_nll * loss_nll
+            loss = loss / grad_accum
 
         loss_val = loss.item()
         if not math.isfinite(loss_val):
-            print(f"[rank {dist.get_rank() if dist.is_initialized() else 0}] "
-                  f"Non-finite loss at step {step_i}: {loss_val}, stopping.")
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            print(f"[rank {rank}] Non-finite loss at step {step_i}: {loss_val}, stopping.")
             raise RuntimeError(f"Training diverged: loss={loss_val} at step {step_i}")
 
+        # Backward pass
+        is_last_micro = ((accum_count + 1) % grad_accum == 0)
         if scaler is not None:
-            is_last_micro_batch = ((accum_count + 1) % grad_accum == 0)
-            if ddp_model is not None and not is_last_micro_batch:
+            if ddp_model is not None and not is_last_micro:
                 with ddp_model.no_sync():
                     scaler.scale(loss).backward()
             else:
                 scaler.scale(loss).backward()
         else:
-            # DDP: skip gradient sync for all but the last micro-batch
-            is_last_micro_batch = ((accum_count + 1) % grad_accum == 0)
-            if ddp_model is not None and not is_last_micro_batch:
+            if ddp_model is not None and not is_last_micro:
                 with ddp_model.no_sync():
                     loss.backward()
             else:
@@ -174,12 +245,15 @@ def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
             optimizer.zero_grad()
+            # EMA update
+            if ema is not None:
+                ema.update(model)
 
         sum_loss += loss_val * grad_accum
         if is_main_process() and step_i % 10 == 0:
             pbar.set_postfix({'loss': f'{loss_val * grad_accum:.6f}'})
 
-    # Flush leftover gradients from incomplete last accumulation group
+    # Flush leftover gradients
     if accum_count % grad_accum != 0:
         if scaler is not None:
             if grad_clip > 0:
@@ -192,11 +266,14 @@ def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
         optimizer.zero_grad()
+        # EMA update
+        if ema is not None:
+            ema.update(model)
 
     return sum_loss / len(train_loader)
 
 
-def valid_3d(val_loader, model, device, ddp=False):
+def valid_3d(val_loader, model, device, ddp=False, ema=None, collect_uncertainty=False):
 
     sum_ssim = 0
     sum_lpips = 0
@@ -207,6 +284,9 @@ def valid_3d(val_loader, model, device, ddp=False):
     n_samples = 0
     total_mse = 0.0
     total_pixels = 0
+    # For uncertainty calibration (ECE / Brier)
+    all_uncertainty = [] if collect_uncertainty else None
+    all_abs_error = [] if collect_uncertainty else None
 
     # Inference: use bf16 on Ampere+, fp16 on older GPUs
     use_amp = (device.type == 'cuda')
@@ -217,88 +297,120 @@ def valid_3d(val_loader, model, device, ddp=False):
             amp_dtype = torch.bfloat16
 
     model.eval()
-    # DDP: move LPIPS model to this rank's GPU (initialized at import time on cuda:0)
-    if HAS_LPIPS and _lpips_model is not None and device.type == 'cuda':
-        lpips_dev = next(_lpips_model.parameters()).device
+    # DDP: move LPIPS model to this rank's GPU (lazy init via shared singleton)
+    _lpips = _ensure_lpips()
+    if _lpips is not None and device.type == 'cuda':
+        lpips_dev = next(_lpips.parameters()).device
         if lpips_dev != device:
-            _lpips_model.to(device)
-    pbar = tqdm(val_loader, desc='valid', dynamic_ncols=True, mininterval=0.5) if is_main_process() else val_loader
-    with torch.inference_mode():
-        for step_i, (inputs, _) in enumerate(pbar):
-            inputs = inputs.to(device)
-            B, T, C, H, W = inputs.shape
-            y_ch = inputs
+            _lpips.to(device)
 
-            if amp_dtype is not None:
-                with autocast(device.type, dtype=amp_dtype):
-                    outputs = model(y_ch)
-            elif use_amp:
-                with autocast(device.type):
-                    outputs = model(y_ch)
-            else:
-                outputs = model(y_ch)
+    # Apply EMA weights for validation
+    if ema is not None:
+        ema.apply(model)
+    try:
+        pbar = tqdm(val_loader, desc='valid', dynamic_ncols=True, mininterval=0.5) if is_main_process() else val_loader
+        with torch.inference_mode():
+            for step_i, (inputs, _) in enumerate(pbar):
+                inputs = inputs.to(device)
+                # Assert expected 5D input: [B, T, C, H, W]
+                assert inputs.dim() == 5, f"Expected 5D input [B,T,C,H,W], got {inputs.dim()}D shape {inputs.shape}"
+                B, T, C, H, W = inputs.shape
+                y_ch = inputs
 
-            pred = outputs.float()  # convert back to fp32 for metric computation
-            target = y_ch
-            mse = F.mse_loss(pred, target)
-            total_mse += mse.item() * pred.numel()
-            total_pixels += pred.numel()
-            running_psnr = 10 * log10(1 / (total_mse / total_pixels)) if total_mse > 0 else 100.0
-
-            # Batch LPIPS: process all B*T frames in one forward pass
-            if HAS_LPIPS:
-                bt = B * T
-                bt_preds = pred.reshape(bt, C, *pred.shape[-2:]).cpu()
-                bt_targets = target.reshape(bt, C, *target.shape[-2:]).cpu()
-                lpips_mean = compute_lpips_batch(bt_preds, bt_targets)
-                if lpips_mean is not None:
-                    sum_lpips += lpips_mean * bt
-                    lpips_count += bt
-
-            for b in range(B):
-                for t in range(T):
-                    n_samples += 1
-                    pred_np = pred[b, t].mean(dim=0).cpu().numpy().astype(np.float64)
-                    tgt_np = target[b, t].mean(dim=0).cpu().numpy().astype(np.float64)
-
-                    # SSIM
-                    sum_ssim += ssim(tgt_np, pred_np, data_range=1)
-
-                    # Edge PSNR (Laplacian domain)
-                    pred_edge = _laplacian(pred_np)
-                    tgt_edge = _laplacian(tgt_np)
-                    edge_range = max(float(pred_edge.max() - pred_edge.min()),
-                                     float(tgt_edge.max() - tgt_edge.min()), 1e-8)
-                    edge_mse = np.mean((pred_edge - tgt_edge) ** 2)
-                    if edge_mse > 0:
-                        sum_edge_psnr += 10 * np.log10(edge_range ** 2 / edge_mse)
-                    else:
-                        sum_edge_psnr += 100.0
-
-                    # ROI PSNR / SSIM (统一使用 metrics.compute_roi_mask)
-                    mask = compute_roi_mask(tgt_np)
-                    pred_roi = pred_np[mask > 0.5]
-                    tgt_roi = tgt_np[mask > 0.5]
-                    if len(pred_roi) > 0:
-                        roi_mse = np.mean((pred_roi - tgt_roi) ** 2)
-                        if roi_mse > 0:
-                            sum_roi_psnr += 10 * np.log10(1.0 / roi_mse)
+                if amp_dtype is not None:
+                    with autocast(device.type, dtype=amp_dtype):
+                        if collect_uncertainty:
+                            outputs, uncertainty = model(y_ch, return_uncertainty=True)
                         else:
-                            sum_roi_psnr += 100.0
-                        pred_masked = pred_np * mask + tgt_np * (1 - mask)
-                        tgt_masked = tgt_np * mask + tgt_np * (1 - mask)
-                        sum_roi_ssim += ssim(tgt_masked, pred_masked, data_range=1)
+                            outputs = model(y_ch)
+                elif use_amp:
+                    with autocast(device.type):
+                        if collect_uncertainty:
+                            outputs, uncertainty = model(y_ch, return_uncertainty=True)
+                        else:
+                            outputs = model(y_ch)
+                else:
+                    if collect_uncertainty:
+                        outputs, uncertainty = model(y_ch, return_uncertainty=True)
+                    else:
+                        outputs = model(y_ch)
 
-            if is_main_process() and step_i % 10 == 0:
-                postfix = {
-                    'psnr': f'{running_psnr:.2f}',
-                    'ssim': f'{sum_ssim / n_samples:.4f}',
-                    'edge': f'{sum_edge_psnr / n_samples:.2f}',
-                    'roi': f'{sum_roi_psnr / n_samples:.2f}',
-                }
-                if lpips_count > 0:
-                    postfix['lpips'] = f'{sum_lpips / lpips_count:.4f}'
-                pbar.set_postfix(postfix)
+                pred = outputs.float()  # convert back to fp32 for metric computation
+                target = y_ch
+                mse = F.mse_loss(pred, target)
+                total_mse += mse.item() * pred.numel()
+                total_pixels += pred.numel()
+                running_psnr = 10 * log10(1 / (total_mse / total_pixels)) if total_mse > 0 else 100.0
+
+                # Uncertainty calibration collection (subsample for memory)
+                if collect_uncertainty and all_uncertainty is not None:
+                    unc = uncertainty.float().cpu().numpy().reshape(-1)
+                    err = (pred - target).abs().float().cpu().numpy().reshape(-1)
+                    # Subsample to avoid OOM on large val sets
+                    if len(unc) > 50000:
+                        idx = np.random.choice(len(unc), 50000, replace=False)
+                        unc = unc[idx]
+                        err = err[idx]
+                    all_uncertainty.append(unc)
+                    all_abs_error.append(err)
+
+                # Batch LPIPS: process all B*T frames in one forward pass
+                if HAS_LPIPS:
+                    bt = B * T
+                    bt_preds = pred.reshape(bt, C, *pred.shape[-2:]).cpu()
+                    bt_targets = target.reshape(bt, C, *target.shape[-2:]).cpu()
+                    lpips_mean = compute_lpips_batch(bt_preds, bt_targets)
+                    if lpips_mean is not None:
+                        sum_lpips += lpips_mean * bt
+                        lpips_count += bt
+
+                for b in range(B):
+                    for t in range(T):
+                        n_samples += 1
+                        pred_np = pred[b, t].mean(dim=0).cpu().numpy().astype(np.float64)
+                        tgt_np = target[b, t].mean(dim=0).cpu().numpy().astype(np.float64)
+
+                        # SSIM
+                        sum_ssim += ssim(tgt_np, pred_np, data_range=1)
+
+                        # Edge PSNR (Laplacian domain)
+                        pred_edge = _laplacian(pred_np)
+                        tgt_edge = _laplacian(tgt_np)
+                        edge_range = max(float(pred_edge.max() - pred_edge.min()),
+                                         float(tgt_edge.max() - tgt_edge.min()), 1e-8)
+                        edge_mse = np.mean((pred_edge - tgt_edge) ** 2)
+                        if edge_mse > 0:
+                            sum_edge_psnr += 10 * np.log10(edge_range ** 2 / edge_mse)
+                        else:
+                            sum_edge_psnr += 100.0
+
+                        # ROI PSNR / SSIM (统一使用 metrics.compute_roi_mask)
+                        mask = compute_roi_mask(tgt_np)
+                        pred_roi = pred_np[mask > 0.5]
+                        tgt_roi = tgt_np[mask > 0.5]
+                        if len(pred_roi) > 0:
+                            roi_mse = np.mean((pred_roi - tgt_roi) ** 2)
+                            if roi_mse > 0:
+                                sum_roi_psnr += 10 * np.log10(1.0 / roi_mse)
+                            else:
+                                sum_roi_psnr += 100.0
+                            pred_masked = pred_np * mask + tgt_np * (1 - mask)
+                            tgt_masked = tgt_np * mask + tgt_np * (1 - mask)
+                            sum_roi_ssim += ssim(tgt_masked, pred_masked, data_range=1)
+
+                if is_main_process() and step_i % 10 == 0:
+                    postfix = {
+                        'psnr': f'{running_psnr:.2f}',
+                        'ssim': f'{sum_ssim / n_samples:.4f}',
+                        'edge': f'{sum_edge_psnr / n_samples:.2f}',
+                        'roi': f'{sum_roi_psnr / n_samples:.2f}',
+                    }
+                    if lpips_count > 0:
+                        postfix['lpips'] = f'{sum_lpips / lpips_count:.4f}'
+                    pbar.set_postfix(postfix)
+    finally:
+        if ema is not None:
+            ema.restore(model)
 
     n = max(n_samples, 1)
 
@@ -329,6 +441,19 @@ def valid_3d(val_loader, model, device, ddp=False):
         sum_roi_psnr / n,
         sum_roi_ssim / n,
     )
+
+    # Uncertainty calibration metrics (ECE / Brier Score)
+    if collect_uncertainty and all_uncertainty:
+        unc_arr = np.concatenate(all_uncertainty)
+        err_arr = np.concatenate(all_abs_error)
+        # uncertainty is variance, convert to std for calibration
+        unc_std = np.sqrt(np.clip(unc_arr, 1e-6, None))
+        ece = compute_ece(unc_std, err_arr)
+        brier = compute_brier_score(unc_std, err_arr)
+        ret = ret + (ece, brier)
+    elif collect_uncertainty:
+        ret = ret + (0.0, 0.0)
+
     return ret
 
 

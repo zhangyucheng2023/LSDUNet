@@ -14,7 +14,7 @@ model_3d = None
 old_rate_3d = 10000
 
 
-def load_3d_model(cs_ratio, checkpoint_path, iter_num=8, model_dim=64, patch=32, num_heads=8):
+def load_3d_model(cs_ratio, checkpoint_path, iter_num=6, model_dim=64, patch=32):
     global model_3d, old_rate_3d
     # 安全设备检测
     if torch.cuda.is_available():
@@ -27,8 +27,7 @@ def load_3d_model(cs_ratio, checkpoint_path, iter_num=8, model_dim=64, patch=32,
         device = torch.device("cpu")
     if model_3d is None or cs_ratio != old_rate_3d:
         model_3d = LSDUNet(ratio=cs_ratio, iter_num=iter_num,
-                           model_dim=model_dim, patch=patch,
-                           num_heads=num_heads).to(device)
+                           model_dim=model_dim, patch=patch).to(device)
         checkpoint = torch.load(checkpoint_path, map_location=device)
         result = model_3d.load_state_dict(checkpoint, strict=False)
         if result.missing_keys:

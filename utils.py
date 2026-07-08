@@ -51,8 +51,16 @@ def setup_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = True
+        # Note: deterministic=True and benchmark=True conflict (deterministic disables
+        # non-deterministic algorithms that benchmark might pick). For reproducibility
+        # use deterministic=True, benchmark=False. For speed use the opposite.
+        # Training prioritizes speed; reproducibility can be enabled via env var.
+        if os.environ.get('DETERMINISTIC', '0') == '1':
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        else:
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
 
 
 

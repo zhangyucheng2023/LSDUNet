@@ -291,3 +291,64 @@ def get_efficiency_metrics(model, input_shape=(1, 8, 3, 224, 224), device='cpu',
         'FLOPs': flops,
         'FPS': fps,
     }
+
+
+# ═══════════════════════════════════════════════════════════
+# 6. 不确定性校准指标 (ECE / Brier Score)
+# ═══════════════════════════════════════════════════════════
+
+def compute_ece(uncertainty, error, n_bins=10):
+    """Expected Calibration Error for regression uncertainty.
+
+    For each uncertainty bin, compare predicted std vs observed RMSE.
+    Lower ECE = better calibrated uncertainty.
+
+    Args:
+        uncertainty: [N] array of predicted std (sqrt(variance))
+        error: [N] array of |pred - target|
+        n_bins: number of bins for uncertainty
+
+    Returns:
+        ece: scalar calibration error
+    """
+    uncertainty = np.asarray(uncertainty, dtype=np.float64).reshape(-1)
+    error = np.asarray(error, dtype=np.float64).reshape(-1)
+    if len(uncertainty) == 0:
+        return 0.0
+    # Clip uncertainty to avoid log issues
+    uncertainty = np.clip(uncertainty, 1e-6, None)
+    bin_edges = np.linspace(uncertainty.min(), uncertainty.max(), n_bins + 1)
+    ece = 0.0
+    n_total = len(uncertainty)
+    for i in range(n_bins):
+        if i == n_bins - 1:
+            mask = (uncertainty >= bin_edges[i]) & (uncertainty <= bin_edges[i + 1])
+        else:
+            mask = (uncertainty >= bin_edges[i]) & (uncertainty < bin_edges[i + 1])
+        if mask.sum() == 0:
+            continue
+        pred_mean = uncertainty[mask].mean()
+        obs_rmse = np.sqrt((error[mask] ** 2).mean())
+        ece += (mask.sum() / n_total) * abs(pred_mean - obs_rmse)
+    return float(ece)
+
+
+def compute_brier_score(uncertainty, error):
+    """Brier score for regression uncertainty.
+
+    BS = mean((uncertainty^2 - error^2)^2)
+    Lower BS = better calibrated.
+
+    Args:
+        uncertainty: [N] array of predicted std
+        error: [N] array of |pred - target|
+
+    Returns:
+        brier: scalar
+    """
+    uncertainty = np.asarray(uncertainty, dtype=np.float64).reshape(-1)
+    error = np.asarray(error, dtype=np.float64).reshape(-1)
+    if len(uncertainty) == 0:
+        return 0.0
+    uncertainty = np.clip(uncertainty, 1e-6, None)
+    return float(np.mean((uncertainty ** 2 - error ** 2) ** 2))

@@ -39,13 +39,15 @@ class SequenceVolumeDataset(Dataset):
         self.num_frames = num_frames
         self.samples = []
         self._seq_dirs = []
+        # Reuse the already-collected frame lists from `sequences` to avoid
+        # redundant directory I/O in _build_cache (collect_sequences already walked).
+        self._seq_cache = {}
         for seq_dir, frames in sequences.items():
             if len(frames) >= num_frames:
                 self._seq_dirs.append(seq_dir)
+                self._seq_cache[seq_dir] = list(frames)  # cache the passed frame list
                 for start in range(0, len(frames) - num_frames + 1, max(1, num_frames // 2)):
                     self.samples.append((len(self._seq_dirs) - 1, start))
-        # 初始化时构建缓存，避免多进程 DataLoader 中每个 worker 重复构建
-        self._seq_cache = self._build_cache()
 
     def __len__(self):
         return len(self.samples)
@@ -67,17 +69,6 @@ class SequenceVolumeDataset(Dataset):
             imgs = transformed
         volume = torch.stack(imgs, dim=0)
         return volume, 0
-
-    def _build_cache(self):
-        cache = {}
-        for seq_dir in self._seq_dirs:
-            frames = sorted(
-                [os.path.join(seq_dir, f) for f in os.listdir(seq_dir)
-                 if f.lower().endswith(IMG_EXTS) and 'Zone.Identifier' not in f],
-                key=lambda p: _parse_frame_num(os.path.basename(p))
-            )
-            cache[seq_dir] = frames
-        return cache
 
 
 def collect_ycb_by_object(root_dir):
@@ -200,7 +191,9 @@ def data_loader_3d(args, root='./',
                    val_split=None,
                    ddp=False):
     kwopt = {'num_workers': 8, 'pin_memory': True, 'prefetch_factor': 4, 'persistent_workers': True}
-    w_size, h_size = int(16 * 16), int(16 * 16)
+    # Resize source must be >= image_size, otherwise RandomCrop/CenterCrop fails.
+    # Use max(256, image_size) to support 448 and other high-resolution evaluations.
+    w_size, h_size = max(256, args.image_size), max(256, args.image_size)
     num_frames = getattr(args, 'num_frames', 8)
 
     trn_transforms = torchvision.transforms.Compose([

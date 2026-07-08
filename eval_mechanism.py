@@ -4,10 +4,10 @@ Output per sequence (saved as .npy):
   basis_weights.npy        [n_frames, K]  – meta-net softmax over K basis matrices
   targets.npy              [n_frames, H, W] – input frames for overlay
   preds.npy                [n_frames, H, W] – reconstructions
-  Per iteration i (0..7):
-    dst_attn_i.npy         [n_frames, H, W] – spatial attention (mean over heads & points)
-    dst_attn_i_full.npy    [n_frames, num_heads, num_points, H, W] – raw attention (i=0 only)
-    lrta_attn_i.npy        [n_frames, num_heads, num_queries, T] – temporal cross-attention
+  Per iteration i (0..5):
+    dst_attn_i.npy         [n_frames, H, W] – spatial attention (offset magnitude)
+    dst_attn_i_full.npy    [n_frames, num_points, H, W] – raw deform offsets (i=0 only)
+    lrta_attn_i.npy        [n_frames, num_queries, T] – temporal cross-attention
 
 Usage:
   python eval_mechanism.py                                    # all datasets, ratio=0.10
@@ -25,8 +25,9 @@ from model.model_3d import LSDUNet
 from data_processor import collect_sequences, collect_ycb_by_object, collect_visgel_sequences
 
 
-def load_model(cs_ratio, checkpoint_path, device='cuda:0'):
-    model = LSDUNet(ratio=cs_ratio, iter_num=8, model_dim=64, patch=32, num_heads=8).to(device)
+def load_model(cs_ratio, checkpoint_path, device='cuda:0', iter_num=6, model_dim=64, patch=32):
+    model = LSDUNet(ratio=cs_ratio, iter_num=iter_num, model_dim=model_dim,
+                    patch=patch).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
     result = model.load_state_dict(ckpt, strict=False)
     if result.missing_keys:
@@ -144,6 +145,10 @@ def main():
                         help='Max sequences per dataset')
     parser.add_argument('--max_frames', type=int, default=0,
                         help='Max frames per sequence (0=all)')
+    # Model architecture params (must match training config)
+    parser.add_argument('--iter_num', type=int, default=6, help='deep unfolding iterations')
+    parser.add_argument('--model_dim', type=int, default=64, help='feature dimension')
+    parser.add_argument('--patch', type=int, default=32, help='CS sampling patch size')
     args = parser.parse_args()
 
     ckpt = f'./trained_model/lsdunet_{args.ratio:.2f}.pth'
@@ -152,7 +157,8 @@ def main():
         sys.exit(1)
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    model = load_model(args.ratio, ckpt, device)
+    model = load_model(args.ratio, ckpt, device, iter_num=args.iter_num,
+                       model_dim=args.model_dim, patch=args.patch)
     print(f"Model loaded: ratio={args.ratio:.2f}")
 
     dataset_names = [d.strip() for d in args.datasets.split(',')]
