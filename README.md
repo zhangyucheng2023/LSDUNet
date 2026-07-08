@@ -12,10 +12,7 @@ LSDUNet/
 ├── data_processor.py             # 数据集加载与预处理
 ├── trainer.py                    # 训练/验证循环 (EMA + 多术语损失)
 ├── train.py                      # 训练入口 (DDP支持)
-├── eval.py                       # 评估入口 (--mode standard|cross-domain)
-├── eval_noise.py                 # 噪声鲁棒性评估 + 消融实验
-├── interpret.py                  # 机制分析与可视化 (export|render|all)
-├── eval_common.py                # 共享评估工具 (模型加载/数据加载/时序评估)
+├── eval.py                       # 统一评估入口 (--mode standard|cross-domain|noise|interpret)
 ├── metrics.py                    # 评估指标 (含ECE/Brier校准)
 ├── utils.py                      # 工具函数
 ├── run_4x4090.sh                 # 4×4090 DDP启动脚本
@@ -211,13 +208,20 @@ bf16 在 Ampere/Ada/Blackwell (sm≥80) 上自动启用，fp16+GradScaler 在旧
 ## 评估
 
 ```bash
-python eval.py                                    # 标准评估 (全数据集, 全压缩比)
-python eval.py --mode cross-domain --image_size 448  # 跨域泛化 (高分辨率 + ECE/Brier)
-python eval_noise.py                              # 噪声鲁棒性评估
-python eval_noise.py --full                       # 完整消融对比 (ConvTok vs LinearTok)
-python interpret.py export --ratio 0.10           # 机制数据导出 (.npy)
-python interpret.py render --ckpt trained_model/lsdunet_0.10.pth  # 论文可视化 (5类图)
-python interpret.py all --ckpt trained_model/lsdunet_0.10.pth     # 导出+可视化
+# 标准评估 (全数据集, 全压缩比)
+python eval.py
+
+# 跨域泛化 (高分辨率 + ECE/Brier)
+python eval.py --mode cross-domain --image_size 448
+
+# 噪声鲁棒性评估
+python eval.py --mode noise
+python eval.py --mode noise --full                # 完整消融对比 (ConvTok vs LinearTok)
+
+# 机制分析与可视化 (--submode export|render|all)
+python eval.py --mode interpret --submode export --ratio 0.10
+python eval.py --mode interpret --submode render --ckpt trained_model/lsdunet_0.10.pth
+python eval.py --mode interpret --submode all --ckpt trained_model/lsdunet_0.10.pth
 ```
 
 ## 安装
