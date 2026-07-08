@@ -1,4 +1,5 @@
 import os
+import sys
 import csv
 import warnings
 import numpy as np
@@ -165,13 +166,92 @@ def _run_temporal_eval_seqs(sequences, mode_tag, label, model, device,
         print(f"{'═' * 100}")
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Cross-domain generalization evaluation (merged from eval_generalization.py)
+# ═══════════════════════════════════════════════════════════════════
+
+def run_cross_domain_eval(args):
+    """Evaluate on higher-resolution (448) + cross-domain datasets with ECE/Brier."""
+    from trainer import valid_3d
+    from eval_common import make_eval_dataloader
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ratios = [float(x.strip()) for x in args.ratios.split(',')]
+    datasets = [d.strip() for d in args.datasets.split(',')]
+
+    os.makedirs(os.path.dirname(args.out_csv) or '.', exist_ok=True)
+    file_exists = os.path.exists(args.out_csv)
+    out_file = open(args.out_csv, 'a' if file_exists else 'w', newline='')
+    writer = csv.writer(out_file)
+    if not file_exists:
+        writer.writerow(['ckpt', 'ratio', 'dataset', 'image_size',
+                         'PSNR', 'SSIM', 'LPIPS', 'Edge_PSNR', 'ROI_PSNR', 'ROI_SSIM',
+                         'ECE', 'Brier'])
+
+    try:
+        for ratio in ratios:
+            ckpt = f'./trained_model/lsdunet_{ratio:.2f}.pth'
+            if not os.path.exists(ckpt):
+                print(f"  [skip] {ckpt} not found")
+                continue
+            model, _ = load_3d_model(ratio, ckpt, iter_num=args.iter_num,
+                                     model_dim=args.model_dim, patch=args.patch)
+            model = model.to(device)
+
+            for ds_name in datasets:
+                ds_path = DATASET_PATHS.get(ds_name, ds_name)
+                if not os.path.isdir(ds_path):
+                    print(f"  [skip] dataset path not found: {ds_path}")
+                    continue
+                loader = make_eval_dataloader(ds_path, args.num_frames, args.image_size)
+                if loader is None:
+                    continue
+                print(f"  [{ds_name}] {len(loader.dataset)} volumes at {args.image_size}×{args.image_size}")
+                result = valid_3d(loader, model, device, ddp=False, ema=None,
+                                  collect_uncertainty=True)
+                psnr, ssim, lpips, edge_psnr, roi_psnr, roi_ssim, ece, brier = result
+                print(f"  ratio={ratio:.2f} dataset={ds_name} size={args.image_size} | "
+                      f"PSNR={psnr:.2f} SSIM={ssim:.4f} ECE={ece:.4f} Brier={brier:.4f}")
+                writer.writerow([os.path.basename(ckpt), f'{ratio:.2f}', ds_name, args.image_size,
+                                 f'{psnr:.4f}', f'{ssim:.6f}',
+                                 f'{lpips:.6f}' if lpips is not None else 'N/A',
+                                 f'{edge_psnr:.4f}', f'{roi_psnr:.4f}', f'{roi_ssim:.6f}',
+                                 f'{ece:.4f}', f'{brier:.4f}'])
+                out_file.flush()
+    finally:
+        out_file.close()
+    print(f"\nResults saved to {args.out_csv}")
+
+
 if __name__ == "__main__":
     from metrics import (evaluate_all, get_efficiency_metrics,
                          compute_temporal_psnr)
     import argparse
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description='LSDUNet evaluation')
+    parser.add_argument('--mode', type=str, default='standard',
+                        choices=['standard', 'cross-domain'],
+                        help='standard: full eval on all datasets | cross-domain: high-res + ECE/Brier')
+    # Cross-domain mode params
+    parser.add_argument('--ratios', type=str, default='0.01,0.04,0.10,0.25,0.50',
+                        help='CS ratios (cross-domain mode)')
+    parser.add_argument('--datasets', type=str, default='touch_and_go,visgel,tacquad,yuan18',
+                        help='datasets for cross-domain mode')
+    parser.add_argument('--image_size', type=int, default=448,
+                        help='image size for cross-domain mode')
+    parser.add_argument('--num_frames', type=int, default=8)
+    parser.add_argument('--out_csv', type=str, default='results/generalization.csv',
+                        help='output CSV for cross-domain mode')
+    parser.add_argument('--iter_num', type=int, default=6)
+    parser.add_argument('--model_dim', type=int, default=64)
+    parser.add_argument('--patch', type=int, default=32)
     args = parser.parse_args()
+
+    if args.mode == 'cross-domain':
+        run_cross_domain_eval(args)
+        sys.exit(0)
+
+    # ─── Standard mode: full evaluation ───
 
     cs_ratios = [0.01, 0.04, 0.10, 0.25, 0.50]
 
