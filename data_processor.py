@@ -60,6 +60,9 @@ class SequenceVolumeDataset(Dataset):
         for i in range(self.num_frames):
             img = Image.open(frames[start + i]).convert('RGB')
             imgs.append(img)
+        # 时序反转增强 (训练时 50% 概率, 对 CS 重建安全)
+        if self.transform is not None and torch.rand(1).item() < 0.5:
+            imgs = imgs[::-1]
         if self.transform:
             seed = torch.initial_seed() + idx
             transformed = []
@@ -201,6 +204,7 @@ def data_loader_3d(args, root='./',
         torchvision.transforms.RandomCrop(args.image_size),
         torchvision.transforms.RandomHorizontalFlip(),
         torchvision.transforms.RandomVerticalFlip(),
+        torchvision.transforms.ColorJitter(brightness=0.1, contrast=0.1),  # 触觉图像亮度/对比度微调
         torchvision.transforms.ToTensor(),
     ])
 

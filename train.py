@@ -55,7 +55,7 @@ def main(cs_ratio):
 
     model = LSDUNet(ratio=cs_ratio, iter_num=args.iter_num,
                      model_dim=args.model_dim, patch=args.patch,
-                     in_ch=3).to(device)
+                     in_ch=3, ls_rank=args.ls_rank).to(device)
 
     # Resume from checkpoint
     start_epoch = 1
@@ -84,10 +84,24 @@ def main(cs_ratio):
     else:
         base_model = model
 
-    # EMA (disabled in debug mode)
-    ema = EMA(base_model, decay=0.999) if not args.debug else None
+    # EMA (disabled in debug mode, warmup decay for faster early tracking)
+    ema = EMA(base_model, decay=args.ema_decay) if not args.debug else None
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    # 学习率分组: 不同模块用不同学习率
+    cs_params = list(base_model.adaptive_s.parameters())
+    sfeat_params = list(base_model.S_feat.parameters())
+    ls_params = []
+    for gdb in base_model.gdb:
+        ls_params.extend(list(gdb.ls_decomp.parameters()))
+    special_ids = set(id(p) for p in cs_params + sfeat_params + ls_params)
+    other_params = [p for p in model.parameters() if id(p) not in special_ids]
+
+    optimizer = optim.AdamW([
+        {'params': cs_params, 'lr': args.lr * 0.1},      # CS 采样矩阵: 小 lr 避免剧烈变化
+        {'params': sfeat_params, 'lr': args.lr * 0.5},   # 特征 CS: 中 lr
+        {'params': ls_params, 'lr': args.lr * 0.5},      # L+S 分解: 中 lr
+        {'params': other_params, 'lr': args.lr},          # 其他: 标准 lr
+    ], lr=args.lr, weight_decay=args.wd)
     main_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warm_epochs,
                                        eta_min=args.flr)
 
@@ -160,7 +174,9 @@ def main(cs_ratio):
                             ema=ema,
                             w_edge=args.w_edge, w_freq=args.w_freq,
                             w_ssim=args.w_ssim,
-                            w_ortho=args.w_ortho, w_nll=args.w_nll)
+                            w_ortho=args.w_ortho, w_nll=args.w_nll,
+                            w_lowrank=args.w_lowrank, w_sparse=args.w_sparse,
+                            epoch=epoch, warm_epochs=args.warm_epochs)
 
             if epoch < args.warm_epochs:
                 warmup_scheduler.step()
@@ -334,6 +350,10 @@ if __name__ == '__main__':
     parser.add_argument('--w_ssim', type=float, default=0.1, help='weight for differentiable SSIM loss')
     parser.add_argument('--w_ortho', type=float, default=0.01, help='weight for sampling-matrix orthogonality loss')
     parser.add_argument('--w_nll', type=float, default=0.01, help='weight for uncertainty NLL loss')
+    parser.add_argument('--w_lowrank', type=float, default=0.01, help='weight for L+S low-rank regularization')
+    parser.add_argument('--w_sparse', type=float, default=0.01, help='weight for L+S sparsity regularization')
+    parser.add_argument('--ls_rank', type=int, default=4, help='rank for L+S decomposition bottleneck')
+    parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA decay (final, after warmup)')
     args = parser.parse_args()
 
     cs_ratios = [float(x.strip()) for x in args.ratios.split(',')]

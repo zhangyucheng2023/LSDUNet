@@ -24,8 +24,9 @@ class EMA:
     sync instead of N per-parameter calls). For a model with ~500 params this
     cuts sync overhead by ~500x.
     """
-    def __init__(self, model, decay=0.999, ddp_sync=True):
+    def __init__(self, model, decay=0.999, ddp_sync=True, warm_decay=0.9):
         self.decay = decay
+        self.warm_decay = warm_decay
         self.ddp_sync = ddp_sync and dist.is_available() and dist.is_initialized()
         self.shadow = {name: p.clone().detach() for name, p in model.named_parameters() if p.requires_grad}
         # Build flattened buffer for efficient all-reduce (1 NCCL call vs N)
@@ -65,12 +66,17 @@ class EMA:
             self.shadow[name].copy_(self._flat_buffer[offset:offset + numel].view(shape))
 
     @torch.no_grad()
-    def update(self, model):
+    def update(self, model, epoch=0, warm_epochs=5):
+        # Warmup decay: 从 warm_decay 线性增长到 decay, 初期跟踪更快
+        if warm_epochs > 0 and epoch < warm_epochs:
+            cur_decay = self.warm_decay + (self.decay - self.warm_decay) * (epoch + 1) / warm_epochs
+        else:
+            cur_decay = self.decay
         for name, p in model.named_parameters():
             if p.requires_grad and name in self.shadow:
                 # p.data is already synchronized across ranks by DDP backward,
                 # so local EMA update produces identical shadow on every rank.
-                self.shadow[name].mul_(self.decay).add_(p.data, alpha=1 - self.decay)
+                self.shadow[name].mul_(cur_decay).add_(p.data, alpha=1 - cur_decay)
         # Defensive periodic sync (cheap insurance against any drift)
         if self.ddp_sync:
             self._sync_shadow()
@@ -210,7 +216,9 @@ def ssim_loss(pred, target, window_size=11, C1=0.01**2, C2=0.03**2):
 def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
              grad_accum=1,
              ddp_model=None, ema=None,
-             w_edge=0.1, w_freq=0.01, w_ortho=0.01, w_nll=0.01, w_ssim=0.1):
+             w_edge=0.1, w_freq=0.01, w_ortho=0.01, w_nll=0.01, w_ssim=0.1,
+             w_lowrank=0.01, w_sparse=0.01,
+             epoch=0, warm_epochs=5):
     """Simplified trainer for LSDUNet-Lite.
 
     No gradient checkpointing needed (lite model is memory-efficient).
@@ -222,6 +230,11 @@ def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
       w_ortho: weight for sampling-matrix orthogonality loss
       w_nll: weight for uncertainty NLL loss
       w_ssim: weight for differentiable SSIM loss
+      w_lowrank: weight for L+S low-rank regularization
+      w_sparse: weight for L+S sparsity regularization
+
+    Warmup: auxiliary losses linearly scale from 0 to full weight during
+    warm_epochs to avoid early-training instability.
     """
     model.train()
     sum_loss = 0
@@ -284,12 +297,23 @@ def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
             loss_nll = 0.5 * (torch.log(var) + sq_err / var).mean()
 
             # Total loss (parameterized weights for grid-search)
+            # 辅助损失 warmup: warmup 阶段线性增长, 避免训练初期不稳定
+            aux_scale = min(1.0, float(epoch + 1) / max(warm_epochs, 1))
             # NOTE: adaptive_s.ortho_loss() is on base_model; access via model.module if DDP
             ortho_model = model.module if hasattr(model, 'module') else model
-            loss = loss_rec + w_edge * loss_edge + w_freq * loss_freq
-            loss = loss + w_ssim * loss_ssim
-            loss = loss + w_ortho * ortho_model.adaptive_s.ortho_loss()
-            loss = loss + w_nll * loss_nll
+            loss = loss_rec  # 主损失不受 warmup 影响
+            loss = loss + aux_scale * (w_edge * loss_edge + w_freq * loss_freq
+                                       + w_ssim * loss_ssim + w_nll * loss_nll)
+            loss = loss + aux_scale * w_ortho * ortho_model.adaptive_s.ortho_loss()
+
+            # L+S 低秩稀疏正则化损失
+            if hasattr(ortho_model, 'get_ls_regularization'):
+                Ls, Ss = ortho_model.get_ls_regularization()
+                if Ls:  # 训练时才有缓存
+                    loss_lowrank = sum(L.pow(2).mean() for L in Ls) / len(Ls)
+                    loss_sparse = sum(S.abs().mean() for S in Ss) / len(Ss)
+                    loss = loss + aux_scale * (w_lowrank * loss_lowrank + w_sparse * loss_sparse)
+
             loss = loss / grad_accum
 
         loss_val = loss.item()
@@ -328,7 +352,7 @@ def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
             optimizer.zero_grad()
             # EMA update
             if ema is not None:
-                ema.update(model)
+                ema.update(model, epoch=epoch, warm_epochs=warm_epochs)
 
         sum_loss += loss_val * grad_accum
         if is_main_process() and step_i % 10 == 0:
@@ -349,7 +373,7 @@ def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
         optimizer.zero_grad()
         # EMA update
         if ema is not None:
-            ema.update(model)
+            ema.update(model, epoch=epoch, warm_epochs=warm_epochs)
 
     return sum_loss / len(train_loader)
 

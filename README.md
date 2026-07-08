@@ -95,8 +95,10 @@ Softplus 预测每像素方差，NLL 损失训练，ECE/Brier Score 评估校准
 | SSIM 结构 | `--w_ssim` | 0.1 | `1 - SSIM(output, target)` (可微) |
 | 不确定性 NLL | `--w_nll` | 0.01 | `0.5·(log(σ²) + (x-μ)²/σ²)` |
 | 正交正则化 | `--w_ortho` | 0.01 | `ortho_loss()` (基矩阵之间) |
+| L+S 低秩 | `--w_lowrank` | 0.01 | `‖L‖²_F` (鼓励低维编码) |
+| L+S 稀疏 | `--w_sparse` | 0.01 | `‖S‖_1` (鼓励稀疏残差) |
 
-DWT 小波损失替代 FFT：多尺度局部时频（非全局频率）、边缘保持、O(N) 复杂度、支持 bf16。
+辅助损失在 warmup 阶段线性增长（避免训练初期不稳定）。DWT 小波损失替代 FFT：多尺度局部时频、边缘保持、O(N) 复杂度、支持 bf16。
 
 ## 数据流
 
@@ -153,6 +155,10 @@ torchrun --nproc_per_node=4 train.py --ratios 0.10 --val_interval 5
 | `--wd` | 0.05 | AdamW 权重衰减 |
 | `--grad_clip` | 1.0 | 梯度裁剪 |
 | `--val_interval` | 5 | 验证间隔 (epoch) |
+| `--ls_rank` | 4 | L+S 分解瓶颈维度 |
+| `--ema_decay` | 0.999 | EMA decay (warmup 后) |
+| `--w_lowrank` | 0.01 | L+S 低秩正则化权重 |
+| `--w_sparse` | 0.01 | L+S 稀疏正则化权重 |
 | `--resume` | False | 从 checkpoint.pth 恢复训练 |
 
 ### GPU 需求

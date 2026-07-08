@@ -709,6 +709,8 @@ class LSDecomposition(nn.Module):
 
     用 1x1x1 卷积瓶颈替代 SVD, 避免 O(n^2) 计算和显存爆炸.
     软阈值是 element-wise 操作, 零额外显存.
+
+    训练时缓存 last_L/last_S 供正则化损失使用.
     """
     def __init__(self, dim, rank=4):
         super().__init__()
@@ -717,6 +719,9 @@ class LSDecomposition(nn.Module):
         self.up = nn.Conv3d(rank, dim, kernel_size=1)
         # 可学习稀疏阈值 (初始化为小值, 训练中自适应)
         self.tau = nn.Parameter(torch.ones(1) * 0.01)
+        # 缓存 L/S 供正则化损失使用 (训练时填充)
+        self.last_L = None
+        self.last_S = None
 
     def forward(self, x):
         """x: [B, C, T, H, W] → [B, C, T, H, W] (L+S 重建)"""
@@ -725,6 +730,10 @@ class LSDecomposition(nn.Module):
         # 稀疏残差 S (软阈值)
         S = x - L
         S = torch.sign(S) * torch.clamp(torch.abs(S) - self.tau, min=0)
+        # 缓存 L/S 供正则化损失使用
+        if self.training:
+            self.last_L = L
+            self.last_S = S
         return L + S
 
 
@@ -738,7 +747,7 @@ class CSGradientStep(nn.Module):
     No forced channel conversions. S_feat operates directly on dim features.
     Back-projection uses adaptive interpolation (resolution-adaptive).
     """
-    def __init__(self, dim, in_ch=3, patch=32):
+    def __init__(self, dim, in_ch=3, patch=32, ls_rank=4):
         super().__init__()
         self.dim = dim
 
@@ -783,7 +792,11 @@ class CSGradientStep(nn.Module):
         )
 
         # L+S 低秩稀疏分解 (轻量化, 近端算子)
-        self.ls_decomp = LSDecomposition(dim, rank=4)
+        self.ls_decomp = LSDecomposition(dim, rank=ls_rank)
+
+        # 残差缩放 (LayerScale 风格, 梯度稳定性, 初始化为小值)
+        self.denoise_scale = nn.Parameter(torch.ones(1) * 0.1)
+        self.refine_scale = nn.Parameter(torch.ones(1) * 0.1)
 
     def forward(self, x, y_feat, x_prev=None):
         """Per-iteration CS gradient step.
@@ -822,12 +835,12 @@ class CSGradientStep(nn.Module):
         # L (低秩): 静态接触结构, S (稀疏): 动态变形
         x = self.ls_decomp(x)
 
-        # --- Step 2: Causal temporal conv denoising ---
+        # --- Step 2: Causal temporal conv denoising (残差缩放) ---
         x_norm = self.denoise_norm(x)
-        x = x + self.causal_conv(x_norm)
+        x = x + self.denoise_scale * self.causal_conv(x_norm)
 
-        # --- Step 3: Residual refinement ---
-        x = x + self.refine(x)
+        # --- Step 3: Residual refinement (残差缩放) ---
+        x = x + self.refine_scale * self.refine(x)
 
         return x
 
@@ -907,7 +920,7 @@ class LSDUNet(nn.Module):
     """
 
     def __init__(self, ratio, iter_num=6, model_dim=64, patch=32,
-                 in_ch=3, d_state=16, **kwargs):
+                 in_ch=3, d_state=16, ls_rank=4, **kwargs):
         super().__init__()
         self.model_dim = model_dim
         self.iter_num = iter_num
@@ -937,13 +950,24 @@ class LSDUNet(nn.Module):
 
         # Deep unfolding iterations
         self.gdb = nn.ModuleList([
-            CSGradientStep(model_dim, in_ch=in_ch, patch=patch)
+            CSGradientStep(model_dim, in_ch=in_ch, patch=patch, ls_rank=ls_rank)
             for _ in range(self.iter_num)
         ])
         self.dst = nn.ModuleList([
             DSTLayer(model_dim)
             for _ in range(self.iter_num)
         ])
+
+    def get_ls_regularization(self):
+        """返回所有迭代的 L/S 张量列表, 供正则化损失使用."""
+        Ls, Ss = [], []
+        base = self.module if hasattr(self, 'module') else self
+        for gdb in base.gdb:
+            ls = gdb.ls_decomp
+            if ls.last_L is not None:
+                Ls.append(ls.last_L)
+                Ss.append(ls.last_S)
+        return Ls, Ss
 
     def _iter_forward(self, i, x, y_feat, x_prev, return_mechanism=False):
         x_out = self.gdb[i](x, y_feat, x_prev)
