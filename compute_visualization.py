@@ -16,38 +16,25 @@ import argparse
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from PIL import Image
 
-from model.model_3d import LSDUNet
-from data_processor import collect_sequences, SequenceVolumeDataset
-import torchvision.transforms as T
-
-
-def load_model(ckpt_path, ratio, device, iter_num=6, model_dim=64, patch=32):
-    model = LSDUNet(ratio=ratio, iter_num=iter_num, model_dim=model_dim,
-                    patch=patch).to(device)
-    state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(state if 'model_state_dict' not in state else state['model_state_dict'])
-    model.eval()
-    return model
+from eval_common import (load_model, make_eval_dataloader, DATASET_PATHS,
+                         KEY_BASIS_WEIGHTS, KEY_SPACE_ATTN, KEY_HISTORY_ATTN,
+                         KEY_UNCERTAINTY, KEY_INTERMEDIATES)
 
 
 def get_sample(val_dir, num_frames=8, image_size=224, idx=0):
-    seqs = collect_sequences(val_dir, min_frames=num_frames)
-    if not seqs:
-        raise FileNotFoundError(f"No sequences with >= {num_frames} frames in {val_dir}")
-    transform = T.Compose([T.Resize((256, 256)), T.CenterCrop(image_size), T.ToTensor()])
-    ds = SequenceVolumeDataset(seqs, num_frames=num_frames, transform=transform)
-    vol, _ = ds[idx]
+    """Load a single volume sample for visualization using shared dataloader."""
+    loader = make_eval_dataloader(val_dir, num_frames=num_frames,
+                                  image_size=image_size, batch_size=1)
+    vol, _ = loader.dataset[idx]
     return vol.unsqueeze(0)  # [1, T, C, H, W]
 
 
 @torch.no_grad()
 def visualize(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = load_model(args.ckpt, args.ratio, device,
-                       iter_num=args.iter_num, model_dim=args.model_dim,
-                       patch=args.patch)
+    model, device = load_model(args.ratio, args.ckpt,
+                               iter_num=args.iter_num, model_dim=args.model_dim,
+                               patch=args.patch)
     vol = get_sample(args.val_dir, num_frames=args.num_frames,
                      image_size=args.image_size, idx=args.sample_idx).to(device)
 

@@ -16,45 +16,18 @@ import argparse
 import csv
 import torch
 import numpy as np
-from data_processor import collect_sequences, SequenceVolumeDataset
 from trainer import valid_3d
 from metrics import count_parameters, measure_flops, measure_fps
-import torchvision.transforms as T
-
-DATASET_PATHS = {
-    'touch_and_go': 'dataset/touch_and_go',
-    'visgel': 'dataset/visgel',
-    'tacquad': 'dataset/tacquad',
-    'yuan18': 'dataset/yuan18',
-}
-
-
-def make_loader(val_dir, num_frames, image_size, batch_size=4):
-    """Build val loader with arbitrary image_size (tests resolution adaptivity)."""
-    seqs = collect_sequences(val_dir, min_frames=num_frames)
-    if not seqs:
-        return None
-    # Match data_processor.py: Resize to (256, 256) for 224; for higher resolutions, use 1.14x
-    resize_size = max(256, int(image_size * 256 / 224))
-    transform = T.Compose([
-        T.Resize((resize_size, resize_size)),  # 256 for 224, 512 for 448
-        T.CenterCrop(image_size),
-        T.ToTensor(),
-    ])
-    ds = SequenceVolumeDataset(seqs, num_frames=num_frames, transform=transform)
-    return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False,
-                                        num_workers=4, pin_memory=True)
+from eval_common import (load_model, make_eval_dataloader, DATASET_PATHS)
 
 
 def evaluate_one(ckpt_path, ratio, val_dir, image_size, num_frames, device,
                  iter_num=6, model_dim=64, patch=32):
-    from model.model_3d import LSDUNet
-    model = LSDUNet(ratio=ratio, iter_num=iter_num, model_dim=model_dim,
-                    patch=patch).to(device)
-    state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(state if 'model_state_dict' not in state else state['model_state_dict'])
+    model, _ = load_model(ratio, ckpt_path, iter_num=iter_num,
+                          model_dim=model_dim, patch=patch, use_cache=False)
+    model = model.to(device)
 
-    loader = make_loader(val_dir, num_frames, image_size)
+    loader = make_eval_dataloader(val_dir, num_frames, image_size)
     if loader is None:
         return None
 

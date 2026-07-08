@@ -21,43 +21,10 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from model.model_3d import LSDUNet
 from data_processor import collect_sequences, collect_ycb_by_object, collect_visgel_sequences
-
-
-def load_model(cs_ratio, checkpoint_path, device='cuda:0', iter_num=6, model_dim=64, patch=32):
-    model = LSDUNet(ratio=cs_ratio, iter_num=iter_num, model_dim=model_dim,
-                    patch=patch).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    result = model.load_state_dict(ckpt, strict=False)
-    if result.missing_keys:
-        print(f"  [WARN] {len(result.missing_keys)} missing keys (new modules random init)")
-    model.eval()
-    return model
-
-
-def load_frame(path):
-    from PIL import Image
-    from torchvision import transforms
-    img = Image.open(path).convert('RGB')
-    t = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-    ])(img)
-    return t
-
-
-def build_clip(frame_buffer, center_idx, clip_len=8):
-    n = len(frame_buffer)
-    half = clip_len // 2
-    indices = []
-    for offset in range(-half, half):
-        idx = max(0, min(n - 1, center_idx + offset))
-        indices.append(idx)
-    clip = torch.stack([frame_buffer[i] for i in indices], dim=0)
-    clip = clip.unsqueeze(0)  # [1, T, 3, H, W]
-    return clip
+from eval_common import (load_model, load_frame, build_temporal_clip as build_clip,
+                         DATASET_PATHS, KEY_SPACE_ATTN, KEY_HISTORY_ATTN,
+                         KEY_BASIS_WEIGHTS, KEY_UNCERTAINTY, KEY_ITER_DATA)
 
 
 def extract_sequence_mechanisms(frame_paths, model, device, out_dir):
@@ -156,9 +123,8 @@ def main():
         print(f"[ERROR] Checkpoint not found: {ckpt}")
         sys.exit(1)
 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    model = load_model(args.ratio, ckpt, device, iter_num=args.iter_num,
-                       model_dim=args.model_dim, patch=args.patch)
+    model, device = load_model(args.ratio, ckpt, iter_num=args.iter_num,
+                               model_dim=args.model_dim, patch=args.patch)
     print(f"Model loaded: ratio={args.ratio:.2f}")
 
     dataset_names = [d.strip() for d in args.datasets.split(',')]

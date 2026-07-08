@@ -10,7 +10,9 @@ from tqdm import tqdm
 
 from model.model_3d import LSDUNet
 from metrics import evaluate_all, compute_temporal_psnr, get_efficiency_metrics
-from eval import load_3d_model, eval_3d_temporal, _load_frame, _build_temporal_clip
+from eval_common import (load_model as load_3d_model, eval_3d_temporal,
+                         load_frame as _load_frame,
+                         build_temporal_clip as _build_temporal_clip)
 from data_processor import collect_sequences, collect_visgel_sequences
 
 

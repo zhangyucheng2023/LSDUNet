@@ -3,103 +3,11 @@ import csv
 import warnings
 import numpy as np
 import torch
-from PIL import Image
-from torchvision import transforms
-from model.model_3d import LSDUNet
 from data_processor import collect_ycb_by_object, collect_sequences, collect_visgel_sequences
+from eval_common import (load_model as load_3d_model, eval_3d_temporal,
+                         DATASET_PATHS)
 
 warnings.filterwarnings("ignore")
-
-model_3d = None
-old_rate_3d = 10000
-
-
-def load_3d_model(cs_ratio, checkpoint_path, iter_num=6, model_dim=64, patch=32):
-    global model_3d, old_rate_3d
-    # 安全设备检测
-    if torch.cuda.is_available():
-        try:
-            device = torch.device("cuda:0")
-            _ = torch.zeros(1).to(device)
-        except Exception:
-            device = torch.device("cpu")
-    else:
-        device = torch.device("cpu")
-    if model_3d is None or cs_ratio != old_rate_3d:
-        model_3d = LSDUNet(ratio=cs_ratio, iter_num=iter_num,
-                           model_dim=model_dim, patch=patch).to(device)
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        result = model_3d.load_state_dict(checkpoint, strict=False)
-        if result.missing_keys:
-            print(f"[WARN] Checkpoint missing {len(result.missing_keys)} keys "
-                  f"(new modules will be randomly initialized):")
-            # 按模块分组显示
-            groups = {}
-            for k in result.missing_keys:
-                prefix = k.split('.')[0]
-                groups.setdefault(prefix, []).append(k)
-            for prefix, keys in groups.items():
-                print(f"  - {prefix}: {len(keys)} params (e.g. {keys[0]})")
-        if result.unexpected_keys:
-            print(f"[WARN] Checkpoint has {len(result.unexpected_keys)} unexpected keys "
-                  f"(old modules removed, ignored)")
-        if not result.missing_keys and not result.unexpected_keys:
-            print("[OK] Checkpoint loaded with full parameter match")
-        model_3d.eval()
-        old_rate_3d = cs_ratio
-    return model_3d, device
-
-
-def _load_frame(path):
-    """加载单帧并转为 RGB 归一化 tensor [3, H, W]"""
-    img = Image.open(path).convert('RGB')
-    img_t = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-    ])(img)                                              # [3, H, W], already [0,1]
-    return img_t
-
-
-def _build_temporal_clip(frame_buffer, center_idx, clip_len=8):
-    """Build [clip_len, 3, H, W] clip centered at center_idx, with edge replication."""
-    n = len(frame_buffer)
-    half = clip_len // 2
-    indices = []
-    for offset in range(-half, half):
-        idx = max(0, min(n - 1, center_idx + offset))
-        indices.append(idx)
-    clip = torch.stack([frame_buffer[i] for i in indices], dim=0)
-    clip = clip.unsqueeze(0)
-    return clip, indices
-
-
-def eval_3d_temporal(frame_paths, model, device, return_intermediates=False):
-    """Sliding window evaluation with T_clip=8."""
-    T_clip = 8
-    n_frames = len(frame_paths)
-    frame_buffer = [_load_frame(p) for p in frame_paths]
-
-    preds = []
-    all_intermediates = []
-
-    for i in range(n_frames):
-        clip, _ = _build_temporal_clip(frame_buffer, i, T_clip)
-        with torch.no_grad():
-            if return_intermediates:
-                out, intermediates = model(clip.to(device), return_intermediates=True)
-                inter_preds = [im[0, T_clip // 2].permute(1, 2, 0).cpu().numpy() for im in intermediates]
-                all_intermediates.append(inter_preds)
-            else:
-                out = model(clip.to(device))
-        pred = out[0, T_clip // 2].permute(1, 2, 0).cpu().numpy()
-        preds.append(pred)
-
-    targets = [f.permute(1, 2, 0).cpu().numpy() for f in frame_buffer]
-
-    if return_intermediates:
-        return preds, targets, all_intermediates
-    return preds, targets
 
 
 
