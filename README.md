@@ -1,6 +1,6 @@
 # LSDUNet — Learned Spatial-temporal Deep Unfolding Network
 
-基于压缩感知 + 深度展开的轻量化触觉视频重建网络。融合 TacMamba (时序压缩) 与 CMLF (贝叶斯融合 + 因果状态空间滤波)，2.637M 参数，支持 4×4090 DDP 训练。
+基于压缩感知 + 深度展开 + L+S 低秩稀疏分解的轻量化触觉视频重建网络。融合 TacMamba (时序压缩) 与 CMLF (贝叶斯融合 + 因果状态空间滤波)，2.640M 参数，支持 4×4090 DDP 训练。
 
 ## 项目结构
 
@@ -64,7 +64,22 @@ compressed = gain·observed + (1-gain)·predicted
 
 ### 5. 深度展开 — CSGradientStep (6次迭代)
 
-每次迭代：特征级CS梯度修正 → 卡尔曼更新 → 跨迭代门控 → 因果时序去噪。
+每次迭代：特征级CS梯度修正 → 卡尔曼更新 → 跨迭代门控 → **L+S 低秩稀疏分解** → 因果时序去噪。
+
+#### L+S 低秩稀疏分解 — LSDecomposition
+
+每次迭代中将特征分解为低秩 + 稀疏两部分（近端算子）：
+
+```
+L = up(down(x))                          ← 通道瓶颈近似低秩 (静态接触结构)
+S = sign(x-L) · max(|x-L| - τ, 0)       ← 软阈值稀疏化 (动态变形)
+x = L + S
+```
+
+- 低秩 L 捕获时序一致的静态接触区域
+- 稀疏 S 捕获空间稀疏的动态变形/滑动
+- 用 1×1×1 卷积瓶颈替代 SVD，避免 O(n²) 开销
+- 6 次迭代共增加 3.5K 参数 (0.13%)
 
 ### 6. 不确定性估计 — UncertaintyHead
 
@@ -98,7 +113,8 @@ DWT 小波损失替代 FFT：多尺度局部时频（非全局频率）、边缘
   ├─ AdaptiveFeatCS: x_tok → adaptive_pool(7×7) → [B, 1, 8, 7, 7]  (只算一次)
   │
   ├─ 深度展开循环 ×6:
-  │   ├─ CSGradientStep: 梯度修正 + 卡尔曼更新 + 因果去噪
+  │   ├─ CSGradientStep: 梯度修正 + 卡尔曼更新 + 门控
+  │   │   └─ LSDecomposition: L(低秩) + S(稀疏) 分解
   │   └─ DSTLayer: DSTTimeBlock + DeformableSpatial + TactileHistoryCompressor
   │
   ├─ 跳跃连接: x += skip_proj(x_tok)
@@ -149,7 +165,7 @@ bf16 在 Ampere/Ada/Blackwell (sm≥80) 上自动启用，fp16+GradScaler 在旧
 | RTX 4090 / 3090 | 24 GB | `batch=8, grad_accum=2 (4卡)` |
 | 更小显存 | <16 GB | `batch=1, grad_accum=16` (仅测试) |
 
-参数量: **2.637M** (ratio=0.10)
+参数量: **2.640M** (ratio=0.10)
 
 ## 评估
 

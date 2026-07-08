@@ -697,6 +697,38 @@ class AdaptiveFeatCS(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# 5.5 LSDecomposition (L+S 低秩稀疏分解, 轻量化)
+# ═══════════════════════════════════════════════════════════════════
+
+class LSDecomposition(nn.Module):
+    """L+S 低秩稀疏分解 (轻量化, 可微).
+
+    将特征分解为:
+    - L (低秩): 通道瓶颈近似, 捕获时序一致的静态接触结构
+    - S (稀疏): 软阈值残差, 捕获空间稀疏的动态变形
+
+    用 1x1x1 卷积瓶颈替代 SVD, 避免 O(n^2) 计算和显存爆炸.
+    软阈值是 element-wise 操作, 零额外显存.
+    """
+    def __init__(self, dim, rank=4):
+        super().__init__()
+        # 低秩近似: 通道瓶颈 C → rank → C
+        self.down = nn.Conv3d(dim, rank, kernel_size=1)
+        self.up = nn.Conv3d(rank, dim, kernel_size=1)
+        # 可学习稀疏阈值 (初始化为小值, 训练中自适应)
+        self.tau = nn.Parameter(torch.ones(1) * 0.01)
+
+    def forward(self, x):
+        """x: [B, C, T, H, W] → [B, C, T, H, W] (L+S 重建)"""
+        # 低秩近似 L (通道瓶颈)
+        L = self.up(self.down(x))
+        # 稀疏残差 S (软阈值)
+        S = x - L
+        S = torch.sign(S) * torch.clamp(torch.abs(S) - self.tau, min=0)
+        return L + S
+
+
+# ═══════════════════════════════════════════════════════════════════
 # 6. CSGradientStep (adaptive, no forced channel conversions)
 # ═══════════════════════════════════════════════════════════════════
 
@@ -750,6 +782,9 @@ class CSGradientStep(nn.Module):
             nn.Conv3d(dim, dim, (1, 3, 3), padding=(0, 1, 1)),
         )
 
+        # L+S 低秩稀疏分解 (轻量化, 近端算子)
+        self.ls_decomp = LSDecomposition(dim, rank=4)
+
     def forward(self, x, y_feat, x_prev=None):
         """Per-iteration CS gradient step.
 
@@ -782,6 +817,10 @@ class CSGradientStep(nn.Module):
             x = gate * x_new + (1 - gate) * x_prev
         else:
             x = x_new
+
+        # --- Step 1.5: L+S 低秩稀疏分解 (近端算子) ---
+        # L (低秩): 静态接触结构, S (稀疏): 动态变形
+        x = self.ls_decomp(x)
 
         # --- Step 2: Causal temporal conv denoising ---
         x_norm = self.denoise_norm(x)
