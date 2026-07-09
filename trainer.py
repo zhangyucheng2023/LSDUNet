@@ -306,11 +306,27 @@ def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
                                        + w_ssim * loss_ssim + w_nll * loss_nll)
             loss = loss + aux_scale * w_ortho * ortho_model.adaptive_s.ortho_loss()
 
-            # L+S 低秩稀疏正则化损失
+            # L+S 低秩稀疏正则化损失 (Schatten-0.5 范数 + L1)
+            # Schatten-p (p=0.5) 比核范数更精确促进低秩: Σ σ^p
+            # 用空间池化后小矩阵 SVD, 开销可忽略
             if hasattr(ortho_model, 'get_ls_regularization'):
                 Ls, Ss = ortho_model.get_ls_regularization()
                 if Ls:  # 训练时才有缓存
-                    loss_lowrank = sum(L.pow(2).mean() for L in Ls) / len(Ls)
+                    loss_lowrank = 0.0
+                    for L in Ls:
+                        # L: [B, C, T, H, W] → 池化 [B, C, T, 4, 4] → [B, T, C*16]
+                        B_l, C_l, T_l, H_l, W_l = L.shape
+                        L_pool = F.adaptive_avg_pool3d(L, (T_l, 4, 4))
+                        L_mat = L_pool.reshape(B_l, T_l, -1)  # [B, T, C*16]
+                        # SVD on small matrix [T, C*16] = [8, 1024], 极快
+                        try:
+                            _, S_sval, _ = torch.linalg.svd(L_mat, full_matrices=False)
+                            # Schatten-0.5: Σ σ^0.5 (比核范数 Σσ 更精确促进低秩)
+                            loss_lowrank = loss_lowrank + S_sval.pow(0.5).sum() / B_l
+                        except RuntimeError:
+                            # SVD 不收敛时退回 Frobenius (数值安全)
+                            loss_lowrank = loss_lowrank + L.pow(2).mean()
+                    loss_lowrank = loss_lowrank / len(Ls)
                     loss_sparse = sum(S.abs().mean() for S in Ss) / len(Ss)
                     loss = loss + aux_scale * (w_lowrank * loss_lowrank + w_sparse * loss_sparse)
 

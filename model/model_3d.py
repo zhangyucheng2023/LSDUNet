@@ -701,36 +701,48 @@ class AdaptiveFeatCS(nn.Module):
 # ═══════════════════════════════════════════════════════════════════
 
 class LSDecomposition(nn.Module):
-    """L+S 低秩稀疏分解 (轻量化, 可微).
+    """时空分离 L+S 低秩稀疏分解 (轻量化, 可微).
 
-    将特征分解为:
-    - L (低秩): 通道瓶颈近似, 捕获时序一致的静态接触结构
-    - S (稀疏): 软阈值残差, 捕获空间稀疏的动态变形
+    借鉴红外图像 STT (Spatio-Temporal Tensor) 思想, 将分解分为两个维度:
+    - L_t (时序低秩): T → rank → T 瓶颈, 捕获帧间相关的静态接触结构
+    - L_s (空间低秩): 通道瓶颈 C → rank → C, 捕获背景均匀区域
+    - S (稀疏): 通道相关软阈值, 捕获空间稀疏的动态变形 + 接触边缘
 
-    用 1x1x1 卷积瓶颈替代 SVD, 避免 O(n^2) 计算和显存爆炸.
-    软阈值是 element-wise 操作, 零额外显存.
+    用瓶颈结构替代 SVD, 避免 O(n^2) 计算和显存爆炸.
+    通道相关阈值: 每通道独立 τ, 适应不同特征通道的稀疏度.
 
-    训练时缓存 last_L/last_S 供正则化损失使用.
+    训练时缓存 last_L/last_S 供 Schatten-p 正则化损失使用.
     """
-    def __init__(self, dim, rank=4):
+    def __init__(self, dim, rank=4, T=8):
         super().__init__()
-        # 低秩近似: 通道瓶颈 C → rank → C
-        self.down = nn.Conv3d(dim, rank, kernel_size=1)
-        self.up = nn.Conv3d(rank, dim, kernel_size=1)
-        # 可学习稀疏阈值 (初始化为小值, 训练中自适应)
-        self.tau = nn.Parameter(torch.ones(1) * 0.01)
+        self.T = T
+        # 时序低秩: T → rank → T (捕获帧间相关性, 静态接触)
+        self.t_down = nn.Linear(T, rank)
+        self.t_up = nn.Linear(rank, T)
+        # 空间低秩: 通道瓶颈 C → rank → C (捕获背景均匀性)
+        self.s_down = nn.Conv3d(dim, rank, kernel_size=1)
+        self.s_up = nn.Conv3d(rank, dim, kernel_size=1)
+        # 通道相关稀疏阈值 (每通道独立, 适应不同特征稀疏度)
+        self.tau = nn.Parameter(torch.ones(dim, 1, 1, 1) * 0.01)
         # 缓存 L/S 供正则化损失使用 (训练时填充)
         self.last_L = None
         self.last_S = None
 
     def forward(self, x):
         """x: [B, C, T, H, W] → [B, C, T, H, W] (L+S 重建)"""
-        # 低秩近似 L (通道瓶颈)
-        L = self.up(self.down(x))
-        # 稀疏残差 S (软阈值)
+        # 时序低秩 L_t: T → rank → T (帧间相关性)
+        # x: [B, C, T, H, W] → [B, C, H, W, T] → Linear(T) → back
+        x_t = x.permute(0, 1, 3, 4, 2)  # [B, C, H, W, T]
+        L_t = self.t_up(self.t_down(x_t))  # [B, C, H, W, T]
+        L_t = L_t.permute(0, 1, 4, 2, 3)  # [B, C, T, H, W]
+        # 空间低秩 L_s: 通道瓶颈 (背景均匀性)
+        L_s = self.s_up(self.s_down(x))  # [B, C, T, H, W]
+        # 联合低秩 L = L_t + L_s
+        L = L_t + L_s
+        # 稀疏残差 S: 通道相关软阈值
         S = x - L
         S = torch.sign(S) * torch.clamp(torch.abs(S) - self.tau, min=0)
-        # 缓存 L/S 供正则化损失使用
+        # 缓存 L/S 供 Schatten-p 正则化损失使用
         if self.training:
             self.last_L = L
             self.last_S = S
@@ -747,7 +759,7 @@ class CSGradientStep(nn.Module):
     No forced channel conversions. S_feat operates directly on dim features.
     Back-projection uses adaptive interpolation (resolution-adaptive).
     """
-    def __init__(self, dim, in_ch=3, patch=32, ls_rank=4):
+    def __init__(self, dim, in_ch=3, patch=32, ls_rank=4, T=8):
         super().__init__()
         self.dim = dim
 
@@ -791,8 +803,8 @@ class CSGradientStep(nn.Module):
             nn.Conv3d(dim, dim, (1, 3, 3), padding=(0, 1, 1)),
         )
 
-        # L+S 低秩稀疏分解 (轻量化, 近端算子)
-        self.ls_decomp = LSDecomposition(dim, rank=ls_rank)
+        # L+S 时空分离低秩稀疏分解 (近端算子)
+        self.ls_decomp = LSDecomposition(dim, rank=ls_rank, T=T)
 
         # 残差缩放 (LayerScale 风格, 梯度稳定性, 初始化为小值)
         self.denoise_scale = nn.Parameter(torch.ones(1) * 0.1)
@@ -920,7 +932,7 @@ class LSDUNet(nn.Module):
     """
 
     def __init__(self, ratio, iter_num=6, model_dim=64, patch=32,
-                 in_ch=3, d_state=16, ls_rank=4, **kwargs):
+                 in_ch=3, d_state=16, ls_rank=4, num_frames=8, **kwargs):
         super().__init__()
         self.model_dim = model_dim
         self.iter_num = iter_num
@@ -950,7 +962,7 @@ class LSDUNet(nn.Module):
 
         # Deep unfolding iterations
         self.gdb = nn.ModuleList([
-            CSGradientStep(model_dim, in_ch=in_ch, patch=patch, ls_rank=ls_rank)
+            CSGradientStep(model_dim, in_ch=in_ch, patch=patch, ls_rank=ls_rank, T=num_frames)
             for _ in range(self.iter_num)
         ])
         self.dst = nn.ModuleList([
