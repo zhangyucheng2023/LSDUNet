@@ -137,7 +137,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
 torchrun --nproc_per_node=4 train.py --ratios 0.10 --val_interval 5
 ```
 
-依次训练 5 个压缩比：`[0.01, 0.04, 0.10, 0.25, 0.50]`，每轮 150 epoch。
+依次训练 3 个关键压缩比：`[0.01, 0.10, 0.50]`（低/中/高，覆盖完整 CS 范围），每轮 150 epoch。
 
 ### 主要超参数
 

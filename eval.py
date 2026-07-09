@@ -353,7 +353,7 @@ def _run_temporal_eval_seqs(sequences, mode_tag, label, model, device,
 
 def run_standard_eval(args):
     """Full evaluation across all datasets and CS ratios."""
-    cs_ratios = [0.01, 0.04, 0.10, 0.25, 0.50]
+    cs_ratios = [0.01, 0.10, 0.50]
 
     # ─── 数据集定义 ───
     # TacQuad 仿真物体 (Physiclear 物体多视角序列)
@@ -709,7 +709,7 @@ def run_cross_domain_eval(args):
 # ═══════════════════════════════════════════════════════════════════
 
 NOISE_LEVELS = [0.0, 0.02, 0.05, 0.10, 0.15, 0.20]
-NOISE_CS_RATIOS = [0.01, 0.04, 0.10, 0.25, 0.50]
+NOISE_CS_RATIOS = [0.01, 0.10, 0.50]
 
 NOISE_RESULT_COLUMNS = [
     'Ratio', 'Sigma', 'Dataset', 'N_Frames',
@@ -1222,7 +1222,7 @@ if __name__ == "__main__":
                         help='Submode for --mode interpret (export|render|all)')
 
     # Cross-domain mode params
-    parser.add_argument('--ratios', type=str, default='0.01,0.04,0.10,0.25,0.50',
+    parser.add_argument('--ratios', type=str, default='0.01,0.10,0.50',
                         help='CS ratios (cross-domain / noise mode)')
     parser.add_argument('--datasets', type=str,
                         default='touch_and_go,visgel,tacquad,yuan18',

@@ -351,8 +351,8 @@ if __name__ == '__main__':
     parser.add_argument('--val_dir', type=str, default='dataset/touch_and_go', help='val dataset path (Touch and Go, 142 seqs)')
     parser.add_argument('--train_split', type=str, default='', help='frame-level split file for train filtering')
     parser.add_argument('--val_split', type=str, default='', help='frame-level split file for val filtering')
-    parser.add_argument('--ratios', type=str, default='0.01,0.04,0.10,0.25,0.50',
-                        help='CS sensing rates, comma-separated (default: 0.01,0.04,0.10,0.25,0.50)')
+    parser.add_argument('--ratios', type=str, default='0.01,0.10,0.50',
+                        help='CS sensing rates, comma-separated (default: 0.01,0.10,0.50 low/mid/high)')
     parser.add_argument('--resume', action='store_true', default=False,
                         help='resume training from last checkpoint in model_dir')
     parser.add_argument('--val_interval', default=5, type=int,

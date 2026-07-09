@@ -4,7 +4,7 @@
 #
 # Usage:
 #   cd /home/tuf/LSDUNet
-#   bash run_4x4090.sh              # full run (5 ratios)
+#   bash run_4x4090.sh              # full run (3 key ratios)
 #   bash run_4x4090.sh --ratios 0.10  # single ratio
 #   bash run_4x4090.sh --debug      # debug (disable EMA, fast smoke test)
 
@@ -22,16 +22,18 @@ export NCCL_DEBUG=WARN
 
 # 4090 supports bfloat16 (Ada Lovelace, compute capability 8.9)
 # Effective batch = 12 (per GPU) × 2 (grad_accum) × 4 (GPUs) = 96
+# 3 key ratios: 0.01 (low), 0.10 (mid), 0.50 (high) — covers full CS range
 
 echo "============================================================"
 echo " LSDUNet: Training on 4×RTX 4090 (DDP)"
 echo " Effective batch: 12×2×4 = 96 | 150 epochs | image=224 | dim=64 | iter=6"
+echo " Ratios: 0.01, 0.10, 0.50 (low/mid/high)"
 echo "============================================================"
 
 torchrun --nproc_per_node=4 --nnodes=1 --rdzv_backend=c10d \
     --rdzv_endpoint=localhost:29501 \
     train.py \
-    --ratios 0.01,0.04,0.10,0.25,0.50 \
+    --ratios 0.01,0.10,0.50 \
     --epochs 150 \
     --batch_size 12 \
     --grad_accum 2 \
