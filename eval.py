@@ -74,7 +74,7 @@ def _get_device():
 
 
 def load_model(cs_ratio, checkpoint_path, iter_num=6, model_dim=64, patch=32,
-               use_cache=True):
+               use_cache=True, ls_rank=4, num_frames=8):
     """Load LSDUNet from checkpoint, with optional singleton cache for speed.
 
     Returns (model, device) tuple. Model is in eval() mode.
@@ -92,7 +92,8 @@ def load_model(cs_ratio, checkpoint_path, iter_num=6, model_dim=64, patch=32,
             return cached, device
 
     model = LSDUNet(ratio=cs_ratio, iter_num=iter_num,
-                    model_dim=model_dim, patch=patch).to(device)
+                    model_dim=model_dim, patch=patch,
+                    ls_rank=ls_rank, num_frames=num_frames).to(device)
     state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     ckpt = state if 'model_state_dict' not in state else state['model_state_dict']
     result = model.load_state_dict(ckpt, strict=False)

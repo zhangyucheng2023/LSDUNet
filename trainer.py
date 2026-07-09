@@ -318,11 +318,11 @@ def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
                         B_l, C_l, T_l, H_l, W_l = L.shape
                         L_pool = F.adaptive_avg_pool3d(L, (T_l, 4, 4))
                         L_mat = L_pool.reshape(B_l, T_l, -1)  # [B, T, C*16]
-                        # SVD on small matrix [T, C*16] = [8, 1024], 极快
+                        # svdvals: 只算奇异值, 比 svd 更快更稳定 (无需 U/V)
+                        # clamp 防止 σ→0 时 σ^0.5 梯度爆炸 (0.5/√σ→∞)
                         try:
-                            _, S_sval, _ = torch.linalg.svd(L_mat, full_matrices=False)
-                            # Schatten-0.5: Σ σ^0.5 (比核范数 Σσ 更精确促进低秩)
-                            loss_lowrank = loss_lowrank + S_sval.pow(0.5).sum() / B_l
+                            S_sval = torch.linalg.svdvals(L_mat)
+                            loss_lowrank = loss_lowrank + S_sval.clamp(min=1e-6).pow(0.5).sum() / B_l
                         except RuntimeError:
                             # SVD 不收敛时退回 Frobenius (数值安全)
                             loss_lowrank = loss_lowrank + L.pow(2).mean()

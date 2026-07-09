@@ -55,7 +55,8 @@ def main(cs_ratio):
 
     model = LSDUNet(ratio=cs_ratio, iter_num=args.iter_num,
                      model_dim=args.model_dim, patch=args.patch,
-                     in_ch=3, ls_rank=args.ls_rank).to(device)
+                     in_ch=3, ls_rank=args.ls_rank,
+                     num_frames=args.num_frames).to(device)
 
     # Resume from checkpoint
     start_epoch = 1
