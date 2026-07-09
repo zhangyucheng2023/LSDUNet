@@ -193,7 +193,7 @@ def data_loader_3d(args, root='./',
                    train_split=None,
                    val_split=None,
                    ddp=False):
-    kwopt = {'num_workers': 8, 'pin_memory': True, 'prefetch_factor': 4, 'persistent_workers': True}
+    kwopt = {'num_workers': 12, 'pin_memory': True, 'prefetch_factor': 4, 'persistent_workers': True}
     # Resize source must be >= image_size, otherwise RandomCrop/CenterCrop fails.
     # Use max(256, image_size) to support 448 and other high-resolution evaluations.
     w_size, h_size = max(256, args.image_size), max(256, args.image_size)

@@ -1017,12 +1017,14 @@ class LSDUNet(nn.Module):
         mech_data = {} if return_mechanism else None
 
         x_prev = None
+        # 训练时关闭梯度 checkpointing: 模型仅 2.64M 参数, 4090 显存充足,
+        # 关闭后省 30% 重算开销, 效果完全相同.
+        # eval 时无梯度, 直接前向.
+        use_ckpt = self.training and x.requires_grad and getattr(self, '_use_ckpt', False)
         for i in range(self.iter_num):
-            if self.training and x.requires_grad:
+            if use_ckpt:
                 if return_mechanism:
                     x_new, mech = _ckpt(self._iter_forward, i, x, y_feat, x_prev, True, use_reentrant=False)
-                    # Detach mechanism tensors (for visualization only) to avoid
-                    # keeping computation graph alive across iterations (memory leak)
                     mech_data[f'iter_{i}'] = {k: v.detach() if torch.is_tensor(v) else v
                                               for k, v in mech.items()}
                 else:
