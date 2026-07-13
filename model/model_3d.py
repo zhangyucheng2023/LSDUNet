@@ -598,6 +598,10 @@ class TactileHistoryCompressor(nn.Module):
 
         self.proj = nn.Conv3d(dim, dim, 1)
 
+        # 隐式 L+S 缓存: L_kalman=平滑状态(低秩), S_kalman=innovation(稀疏)
+        self.last_L_kalman = None
+        self.last_S_kalman = None
+
     def forward(self, x, return_attn=False):
         B, C, T, H, W = x.shape
         x_norm = self.norm(x)
@@ -620,6 +624,13 @@ class TactileHistoryCompressor(nn.Module):
         # gain ∈ [0, 1]: high gain → trust observation, low gain → trust prediction
         gain = self.kalman_gain(torch.cat([predicted, observed], dim=-1))  # [B, T, C]
         compressed = gain * observed + (1 - gain) * predicted
+
+        # 隐式 L+S 分离 (Kalman 物理意义):
+        #   L_kalman = compressed (平滑状态 → 低秩, 对应稳定接触背景)
+        #   S_kalman = observed - predicted (innovation → 稀疏, 对应突变的滑动/碰撞)
+        if self.training:
+            self.last_L_kalman = compressed  # [B, T, C]
+            self.last_S_kalman = observed - predicted  # [B, T, C]
 
         # Adaptive query weighting (per-sample, input-dependent)
         q_weights = self.query_gate(x_norm)  # [B, num_queries]
@@ -971,14 +982,26 @@ class LSDUNet(nn.Module):
         ])
 
     def get_ls_regularization(self):
-        """返回所有迭代的 L/S 张量列表, 供正则化损失使用."""
+        """返回所有迭代的 L/S 张量列表, 供正则化损失使用.
+
+        双重 L+S 来源:
+          ① 显式 LSDecomposition (时空分离 + Schatten-p)
+          ② 隐式 CausalLatentFilter (Kalman 平滑状态=L, innovation=S)
+        """
         Ls, Ss = [], []
         base = self.module if hasattr(self, 'module') else self
+        # ① 显式 L+S: LSDecomposition
         for gdb in base.gdb:
             ls = gdb.ls_decomp
             if ls.last_L is not None:
                 Ls.append(ls.last_L)
                 Ss.append(ls.last_S)
+        # ② 隐式 L+S: Kalman 滤波 (L=平滑状态, S=innovation)
+        for dst in base.dst:
+            thc = dst.history
+            if thc.last_L_kalman is not None:
+                Ls.append(thc.last_L_kalman)
+                Ss.append(thc.last_S_kalman)
         return Ls, Ss
 
     def _iter_forward(self, i, x, y_feat, x_prev, return_mechanism=False):
