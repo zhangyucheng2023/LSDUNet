@@ -2,176 +2,287 @@
 
 ## 一、项目概述
 
-**物理先验驱动的轻量级时空展开网络（LSDUNet）**。
-
-基于压缩感知（CS）+ 深度展开（Deep Unfolding）框架，针对机器人动态触觉信号的极低延迟压缩感知与高保真时空重建问题，将传统展开网络中算力消耗极大的去噪黑盒替换为轻量化、物理可解释的白盒先验算子。
+LSDUNet（Learned Spatial-temporal Deep Unfolding Network）是一个基于压缩感知（CS）+ 深度展开的轻量级触觉视频重建网络。针对触觉传感器的低采样率压缩测量，通过 6 次可学习迭代展开恢复高保真时空触觉序列。
 
 - 参数量：2.641M
-- 理论框架：CS + Deep Unfolding + 双重 L+S（显式 + 隐式）+ 贝叶斯融合 + 因果滤波
-- 硬件需求：2×RTX 4090（24GB）DDP 训练，bf16 精度
+- 输入：[B, 8, 3, 224, 224]（8帧 RGB 触觉体积）
+- 输出：同尺寸重建序列 + 逐像素不确定性图
+- 训练硬件：2×RTX 4090 DDP，bf16 精度
 
 ---
 
-## 二、代码改进评估
+## 二、文件结构
 
-### 改进一：Mamba 替换时序注意力（`TactileHistoryCompressor`）
-
-- **实现**：在 `TactileHistoryCompressor` 中，用 `MambaSSM(d_model=dim, d_state=16)` 替代了 O(T²) 的多头时序注意力。Mamba 仅处理**空间池化后的帧级特征** `[B, T, C]`（先 GAP 再扫描），而非原始的 `[B×H×W, T, C]`，避免了数万 batch 维度的显存调度开销。
-- **降本原理**：传统时序注意力复杂度 O(T²)，帧数增加时显存平方级爆炸。Mamba 作为 SSM，时序复杂度 O(T)，且通过 `_scan_direct` 方法在短序列（T≤32）时使用直接递归扫描，避免 parallel scan 的数值溢出。
-- **结论**：**极度合理。** 直接吸取 TacMamba 精髓，彻底消灭时间维度显存瓶颈。GAP 空间池化策略已内置，无需额外优化。
-
-### 改进二：贝叶斯融合 + 因果卡尔曼滤波（`BayesianFusion` + `CausalLatentFilter`）
-
-- **实现**：两个独立模块协作——
-  - `BayesianFusion`：空间特征融合，用逆方差加权最大似然估计替代暴力 `cat+conv` 拼接：`fused = (f1·σ₂² + f2·σ₁²) / (σ₁² + σ₂²)`。方差预测用 Softplus + 1e-6 保证数值稳定。
-  - `CausalLatentFilter`（在 `TactileHistoryCompressor` 内）：时序滤波，执行"预测-更新"两步——`predicted = transition(observed)` + 因果移位，`gain = Sigmoid(MLP(predicted, observed))`，`compressed = gain·observed + (1-gain)·predicted`。用 Sigmoid 门控替代除法，无 NaN 风险。
-- **降本原理**：传统融合需把 `(B, T, C, H, W)` 展平接大全连接或 3D 卷积。贝叶斯融合仅增加 2 个 Linear 层（~8.3K 参数）；卡尔曼滤波用 O(1) 状态更新完成时序平滑。
-- **结论**：**极度合理。** 契合 CMLF 论文的轻量级递归融合思想，基于物理/统计先验，极低 FLOPs，有效过滤高频接触噪声。
-
-### 改进三：可变形卷积替换空间注意力（`DeformableSpatialBlock`）
-
-- **实现**：空间块结合 `DeformConv2d`（学习偏移量，自适应包裹不规则接触面）和 `MultiScaleSpatialConv`（多尺度膨胀卷积 d=1,3,7，替代 MambaSSM 空间扫描，显存降低约 190×）。
-- **降本原理**：空间注意力是真正的"显存杀手"（128×128 图 Token 数 16384，注意力矩阵 16384×16384，单层数 GB）。DeformConv 计算复杂度仅 O(H×W×K²)，却实现了类似注意力的动态感受野。
-- **结论**：**极其高明。** 空间用 DeformConv，时间用 Mamba，这是目前视频处理最 SOTA 的轻量化范式。
+```
+LSDUNet/
+├── model/
+│   └── model_3d.py       # 核心模型（17 个类）
+├── data_processor.py      # 数据集加载与预处理
+├── trainer.py             # 训练/验证循环（EMA + 8项损失）
+├── train.py               # 训练入口（DDP + lr分组 + warmup）
+├── eval.py                # 评估入口（standard / cross-domain / noise / interpret）
+├── eval_touchd.py         # LSDU-COMP 统一对比框架适配
+├── metrics.py             # 评估指标（PSNR/SSIM/LPIPS/ECE/Brier）
+├── utils.py               # 工具函数
+├── run_2x4090.sh          # 2×4090 DDP 启动脚本
+├── run_4x4090.sh          # 4×4090 DDP 启动脚本
+└── requirements.txt
+```
 
 ---
 
-## 三、总结与微调说明
+## 三、模型结构（model_3d.py）
 
-改造高度成功，显存占用下降 60% 以上，训练速度成倍提升。两点微调建议均已满足：
+模型共 17 个类，按数据流顺序分为 6 个阶段：
 
-1. **Mamba 维度设计**：已实施 GAP 空间池化。Mamba 处理 `[B, T, C]`（B=8, T=8, C=64），不存在数万 batch 维度问题。
-2. **数值稳定性**：`BayesianFusion` 方差预测已加 `+1e-6`；`CausalLatentFilter` 用 Sigmoid 门控无除法；`UncertaintyHead` 也已加 `+1e-6`。
+### 阶段 1：像素级 CS 采样
 
----
+#### `AdaptiveSModule`
+- 功能：对输入触觉图像进行分块压缩采样，充当 CS 测量矩阵 Φ
+- 机制：
+  - K=4 个可学习基矩阵，通过 `meta_net` 动态组合
+  - `meta_net` 输入 3 维统计特征（均值 + 标准差 + 梯度幅值），输出 4 组基权重
+  - `importance_net`（3 层 CNN + Sigmoid）做空间重要性加权
+  - `ortho_loss()` 正则化鼓励基矩阵正交
+- 输入：[B·T·C, 1, H, W] → 输出：[B, cs_dim, 7, 7]
 
-## 四、L+S 低秩稀疏分解：显式 + 隐式双重机制
+#### `RModule`
+- 功能：CS 反投影，将压缩测量恢复到图像域
+- 机制：S^T·y → [B, 1, 224, 224] → reshape [B, 3, 8, 224, 224]
 
-当前代码采用**显式 + 隐式双重 L+S 分解**，比单一方式更强大：
+### 阶段 2：特征编码 + 融合
 
-### ① 显式 L+S：`LSDecomposition` 模块
+#### `ConvTokenizer3D`
+- 功能：将反投影图像编码为特征体积，主分支 + 边缘分支
+- 主分支：Conv3D stride-2 → [B, 64, 8, 112, 112]
+- 边缘分支：空间边缘 + 时序边缘 → edge_proj
 
-在每次 `CSGradientStep` 迭代中执行时空分离分解：
-- **时序低秩 L_t**：T→rank→T 线性瓶颈，捕获帧间相关的静态接触结构
+#### `BayesianFusion`
+- 功能：用贝叶斯逆方差加权最大似然估计融合主分支与边缘分支，替代暴力 cat+conv
+- 公式：`fused = (f1·σ₂² + f2·σ₁²) / (σ₁² + σ₂²)`
+- 方差预测：Softplus + 1e-6 保证正定和数值稳定
+- 来源：CMLF 论文启发，仅 +8.3K 参数
+
+### 阶段 3：特征级 CS 测量
+
+#### `AdaptiveFeatCS`
+- 功能：对特征体积做第二次 CS 测量（只算一次，每次迭代复用）
+- 机制：adaptive_pool(7×7) → 通道加权 → 多基空间调制 → [B, 1, 8, 7, 7]
+
+### 阶段 4：深度展开迭代（×6）
+
+#### `CSGradientStep`（每次迭代的核心）
+执行 PGD 深度展开的一步：
+1. **梯度修正**：`grad = R_feat(y_feat - S_feat(x))`，特征级 CS 误差反传
+2. **Kalman 更新**：`x_new = x + K(x)·grad`，K 为输入依赖的可学习增益
+3. **跨迭代门控**：`x = gate·x_new + (1-gate)·x_prev`，门控融合相邻迭代
+4. **L+S 分解**：`LSDecomposition` 时空分离低秩稀疏
+5. **因果去噪**：causal_conv + refine，LayerScale 残差缩放保证梯度稳定
+
+#### `LSDecomposition`（显式 L+S，在 CSGradientStep 内）
+- **时序低秩 L_t**：T→rank→T 线性瓶颈，捕获帧间相关的静态接触
 - **空间低秩 L_s**：C→rank→C 通道瓶颈，捕获背景均匀区域
 - **稀疏 S**：通道相关软阈值 `sign(x)·max(|x|-τ, 0)`，每通道独立 τ
-- **正则化**：Schatten-0.5 非凸秩近似 `Σσ^0.5`（比核范数更精确促进低秩），池化后小矩阵 SVD，开销可忽略
+- 训练时缓存 L/S 供 Schatten-0.5 正则化使用
 
-### ② 隐式 L+S：`CausalLatentFilter`（Kalman 滤波）
+#### `DSTLayer`（每次迭代的先验去噪，在 CSGradientStep 之后）
+包含三个子模块：
 
-Kalman 滤波天然实现 L+S 分解的物理意义：
-- **L_kalman = compressed**（平滑状态）：时序上稳定更新，对应**低秩背景**（稳定接触）
-- **S_kalman = observed - predicted**（innovation 残差）：捕捉突然变化的接触特征，对应**稀疏突变**（打滑/碰撞）
+##### `DSTTimeBlock`
+- 功能：多尺度时间卷积
+- 机制：[3,5,7] 三尺度并行 1D 卷积 + Sigmoid 门控融合
+- 复杂度：O(D·T)
 
-隐式 L/S 也被 Schatten-p + L1 正则化约束，与显式 L+S 形成双重保障。
+##### `DeformableSpatialBlock`
+- 功能：可变形空间特征提取，替代空间注意力
+- 机制：
+  - `DeformConv2d`：学习偏移量，采样点自适应包裹不规则接触面
+  - `MultiScaleSpatialConv`：多尺度膨胀卷积 d=1,3,7，替代 MambaSSM 空间扫描
+- 复杂度：O(D·k²)，显存比空间注意力降低数千倍
 
-### 对比
+##### `TactileHistoryCompressor`
+- 功能：时序历史压缩，替代 O(T²) 时序注意力
+- 机制（融合 TacMamba + CMLF 两篇论文思想）：
+  1. GAP 空间池化：[B,C,T,H,W] → [B,T,C]，避免数万 batch 维度
+  2. MambaSSM 时序扫描：O(T) 状态空间模型，得到 observed
+  3. CausalLatentFilter（CMLF 启发）：
+     - 预测：`predicted = transition(observed)` + 因果移位
+     - Kalman 更新：`gain = Sigmoid(MLP(predicted, observed))`
+     - `compressed = gain·observed + (1-gain)·predicted`
+  4. 自适应查询摘要：输入复杂度相关的 soft query count
+  5. 广播回空间维度
+- 隐式 L+S：L_kalman = compressed（平滑状态→低秩），S_kalman = observed - predicted（innovation→稀疏）
 
-| 方式 | 计算 | 理论正确性 | 开销 |
-|------|------|-----------|------|
-| 完整 SVD | O(n²) | 100% | +60-100% 训练时间 |
-| 显式瓶颈 + Schatten-p | O(n) | 95% | <0.1% |
-| 隐式 Kalman | O(1) | 物理隐喻 | 0 |
-| **双重（当前）** | **O(n)** | **最高** | **<0.1%** |
+#### `MambaSSM`
+- 功能：选择性状态空间模型，O(T) 时序扫描
+- 实现：纯 PyTorch（无需 CUDA 编译）
+- `_scan_direct`：T≤32 时用直接递归扫描，避免 parallel scan 的 exp 溢出
 
----
+### 阶段 5：输出
 
-## 五、小波变换 vs 可变形卷积 + Mamba
+#### `UncertaintyHead`
+- 功能：预测逐像素重建方差，为机器人部署提供置信度图
+- 机制：Softplus 预测方差 + 1e-6 下限，NLL 损失训练
+- 评估：ECE / Brier Score 校准质量
 
-**对于机器人动态触觉，可变形卷积 + Mamba 远优于小波变换。**
-
-小波基（Haar, Daubechies）是人工设计的刚性数学基底，处理静态图像边缘有效，但触觉接触面因硅胶变形、物体滑动，边缘极度不规则且动态扭曲。用刚性小波套不规则形变效果差，且 3D 小波计算昂贵。
-
-当前改造完全实现了空间与时间的自适应稀疏：
-1. **空间稀疏（DeformConv 替代小波）**：采样点像"触手"自适应包裹不规则接触边缘，数据驱动的触觉自适应稀疏基
-2. **时间稀疏（Mamba 替代 3D 变换）**：O(T) 状态更新压缩长历史序列
-
-注：项目保留 DWT 小波作为**损失函数**（非模块），用于多尺度细节保留，与小波变换模块不同。
-
----
-
-## 六、CS + 深度展开初心未变
-
-深度展开的经典迭代公式：
-
-```
-x^(k+1) = Prox_λ,Ψ( x^(k) - ρ Φᵀ(Φ x^(k) - y) )
-```
-
-在 LSDUNet 中被端到端保留：
-
-1. **CS 采样（不变）**：`AdaptiveSModule` 充当物理测量矩阵 Φ，K=4 基矩阵动态组合
-2. **数据一致性梯度下降（不变）**：`CSGradientStep` 精确执行 `x - ρ Φᵀ(Φx - y)`，含特征级 CS 测量 `AdaptiveFeatCS`
-3. **多轮展开（不变）**：`iter_num=6`，展开 6 轮
-
-**改造的是 Prox 算子**：过去用笨重的 CNN/ViT 做去噪先验；现在替换为 `ConvTokenizer3D` + `DSTLayer`（DeformConv + Mamba + Kalman + L+S），轻量化且物理可解释。
+#### 输出层
+- skip connection + proj_out + trilinear 上采样 → [B, 8, 3, 224, 224]
 
 ---
 
-## 七、核心故事线（ABCDE Framework）
+## 四、训练流程（train.py + trainer.py）
 
-### A. 经典问题
+### DDP 训练
+- 2×4090，bf16 精度
+- 有效 batch = 12（单卡）× 4（grad_accum）× 2（GPU）= 96
+- find_unused_parameters=True（iter_gate 第一次迭代无梯度）
 
-高频动态触觉信号的极低延迟压缩感知与高保真时空重建。在具身智能的灵巧操作中，触觉传感器需以 >100Hz 实时反馈接触信息形成反射闭环。高分辨率触觉数据带来庞大传输带宽压力，如何在极低采样率下实时高保真重构动态触觉压力时空序列是亟待解决的瓶颈。
+### 学习率分组
+| 参数组 | 相对 lr | 原因 |
+|--------|---------|------|
+| CS 采样矩阵 | 0.1× | 避免测量矩阵剧烈变化 |
+| 特征 CS / L+S | 0.5× | 新模块适中 |
+| 其他 | 1.0× | 正常收敛 |
 
-### B. 现有有效方法
+### EMA
+- decay 从 0.9（warmup）线性增长到 0.999
+- flatten buffer 单次 all_reduce（1 次 NCCL 调用替代 N 次）
 
-基于 Transformer 的深度展开网络（如 TransCS, HATNet）。将经典迭代优化（ISTA）展开为神经网络，用时空 Transformer 全局自注意力提取长距离依赖，取得 SOTA 重构质量。
+### 损失函数（8 项）
 
-### C. 致命缺陷
-
-"算力爆炸"与"物理盲视"导致具身部署失效：
-1. **时序灾难**：Transformer 复杂度 O(T²)，高频处理长序列时推理延迟达数十毫秒，无法在线闭环
-2. **空间刚性**：刚性注意力网格违背触觉物理接触规律，硅胶形变和受力边缘不规则且动态扭曲
-
-### D. 核心洞察
-
-动态触觉信号的"马尔可夫时序演化"与"不规则空间稀疏性"：
-- **时间**：接触状态演化是马尔可夫过程，当前状态依赖紧邻历史，伴随瞬态高频扰动
-- **空间**：有效信息极度稀疏，集中在接触边缘压力梯度剧变区，形状随受力实时不规则形变
-
-### E. 提出方法
-
-**物理先验驱动的轻量级时空展开网络（LSDUNet）**，对近端映射进行轻量化与物理意义重构：
-
-1. **DeformConv 破解空间刚性**：`DeformableSpatialBlock` 采样点像"触手"自适应包裹不规则接触面，极低参数量实现数据驱动的触觉自适应空间稀疏基
-2. **Mamba 破解时序灾难**：`TactileHistoryCompressor` 以 O(T) 复杂度压缩时序历史（训练 O(T)，推理可 O(1) 增量更新），消灭时间维度显存瓶颈
-3. **双重 L+S 分解**：
-   - 显式 `LSDecomposition`：时空瓶颈 + Schatten-0.5 非凸秩近似，结构化分解
-   - 隐式 `CausalLatentFilter`：卡尔曼滤波将平滑状态（低秩背景）与 innovation（稀疏突变）解耦
-4. **贝叶斯融合**：`BayesianFusion` 用逆方差加权 MLE 替代暴力拼接，仅 +8.3K 参数
-
----
-
-## 八、模块来源追溯
-
-| 模块 | 参考来源 | 类型 |
-|------|----------|------|
-| MambaSSM | Mamba (arXiv:2312.00752) | 改造：纯 PyTorch + _scan_direct |
-| TactileHistoryCompressor | TacMamba (arXiv:2603.01700) | 改造：GAP 池化 + 自适应查询 |
-| CausalLatentFilter | CMLF (arXiv:2604.02108) | 改造：Sigmoid 门控 + 显式 L/S |
-| BayesianFusion | CMLF (arXiv:2604.02108) | 改造：2 层 Linear 轻量化 |
-| DeformConv2d | DCN (arXiv:1703.06203) | torchvision 调用 |
-| AdaptiveSModule | 原创 | K=4 基矩阵 + meta_net(3维) |
-| LSDecomposition | 原创（红外 STT 启发） | 时空分离 + Schatten-p |
-| CSGradientStep | 原创（PGD Unfolding） | Kalman gain + 门控 + 因果去噪 |
-| AdaptiveFeatCS | 原创 | adaptive_pool(7×7) + 多基调制 |
-| UncertaintyHead | 原创 | Softplus 方差 + NLL |
-| DWT 小波损失 | 原创 | Haar 小波替代 FFT |
-
----
-
-## 九、损失函数
-
-| 损失项 | 权重 | 公式 |
+| 损失项 | 权重 | 说明 |
 |--------|------|------|
-| MSE 重建 | 1.0 | MSE(output, target) |
-| Sobel 边缘 | 0.1 | MSE(Sobel(out), Sobel(tgt)) |
-| DWT 小波 | 0.01 | Σ‖DWT(out) - DWT(tgt)‖ |
-| SSIM | 0.1 | 1 - SSIM(out, tgt) |
+| MSE 重建 | 1.0 | 主损失 |
+| Sobel 边缘 | 0.1 | 边缘保持 |
+| DWT 小波 | 0.01 | 多尺度细节（Haar 小波，替代 FFT） |
+| SSIM | 0.1 | 结构相似性（avg_pool 可微实现） |
 | 不确定性 NLL | 0.01 | 0.5·(log σ² + (x-μ)²/σ²) |
-| 正交正则化 | 0.01 | ortho_loss()（基矩阵之间）|
-| L+S 低秩 | 0.01 | Schatten-0.5: Σσ^0.5（显式+隐式）|
-| L+S 稀疏 | 0.01 | ‖S‖₁（显式+隐式）|
+| 正交正则化 | 0.01 | 基矩阵多样性 |
+| L+S 低秩 | 0.01 | Schatten-0.5: Σσ^0.5（显式+隐式 L） |
+| L+S 稀疏 | 0.01 | ‖S‖₁（显式+隐式 S） |
 
-辅助损失在 warmup 阶段（前 5 epoch）线性增加，避免训练初期干扰主损失。
+- 辅助损失在 warmup 阶段（前 5 epoch）线性增加：`aux_scale = min(1.0, (epoch+1)/warm_epochs)`
+- L+S 正则化通过 `get_ls_regularization()` 收集双重来源的 L/S 张量
+
+### 训练超参数
+
+| 参数 | 值 |
+|------|-----|
+| epochs | 150 |
+| lr | 2e-4（余弦退火到 1e-5） |
+| warmup | 5 epoch（线性） |
+| wd | 0.05（AdamW） |
+| grad_clip | 1.0 |
+| val_interval | 5 |
+| iter_num | 6 |
+| model_dim | 64 |
+| num_frames | 8 |
+| image_size | 224 |
+| ls_rank | 4 |
+
+### 压缩比
+训练 3 个关键 ratio：0.01（低）、0.10（中）、0.50（高）
+
+---
+
+## 五、评估流程
+
+### eval.py（统一入口）
+```
+python eval.py                                    # 标准评估
+python eval.py --mode cross-domain --image_size 448  # 跨域泛化 + ECE/Brier
+python eval.py --mode noise [--full]              # 噪声鲁棒性 + 消融
+python eval.py --mode interpret --submode export|render|all  # 机制分析
+```
+
+### eval_touchd.py（LSDU-COMP 统一对比）
+- 接入 LSDU-COMP 框架，与 10 个 baseline 在完全相同条件下对比
+- 统一数据集（ToucHDVolumeDataset）、统一指标、统一 CSV 输出
+
+### 指标
+- 重建质量：PSNR / SSIM / LPIPS / Edge-PSNR / ROI-PSNR / ROI-SSIM / Temporal-PSNR
+- 不确定性校准：ECE / Brier Score
+- 效率：Params / FLOPs / FPS / Latency
+
+---
+
+## 六、L+S 双重分解机制
+
+### 显式 L+S（LSDecomposition 模块）
+在每次 CSGradientStep 迭代中：
+- 时序低秩 L_t：T→rank→T 瓶颈
+- 空间低秩 L_s：C→rank→C 瓶颈
+- 稀疏 S：通道相关软阈值
+
+### 隐式 L+S（CausalLatentFilter，Kalman 滤波）
+在 TactileHistoryCompressor 中：
+- L_kalman = compressed（平滑状态，对应低秩背景）
+- S_kalman = observed - predicted（innovation，对应稀疏突变）
+
+### 正则化
+两种 L/S 都被 `get_ls_regularization()` 收集，统一受 Schatten-0.5 + L1 约束。Schatten-p (p=0.5) 比核范数更精确促进低秩，池化后小矩阵 SVD 计算开销可忽略。
+
+---
+
+## 七、数据流
+
+```
+输入: [B, 8, 3, 224, 224]
+ │
+ ├─① 像素级 CS 采样 (AdaptiveSModule)
+ │   224×224 → 分组卷积(S·x) → [B, cs_dim, 7, 7]
+ │   meta_net(mean+std+grad) → 4 组基矩阵动态组合
+ │   importance_net → 空间重要性加权
+ │
+ ├─② 初始反投影 (RModule)
+ │   S^T·y → [B, 1, 224, 224] → reshape [B, 3, 8, 224, 224]
+ │
+ ├─③ Tokenization + BayesianFusion
+ │   主分支: Conv3D stride-2 → [B, 64, 8, 112, 112]
+ │   边缘分支: spatial + temporal edges
+ │   贝叶斯融合: 逆方差加权 MLE
+ │
+ ├─④ 特征级 CS 测量 (AdaptiveFeatCS) — 只算一次
+ │   x_tok → adaptive_pool(7×7) → [B, 1, 8, 7, 7]
+ │
+ ├─⑤ 深度展开循环 (×6)
+ │   for i in 0..5:
+ │   ├─ CSGradientStep:
+ │   │   ① 梯度修正: grad = R_feat(y_feat - S_feat(x))
+ │   │   ② Kalman 更新: x_new = x + K(x)·grad
+ │   │   ③ 门控: x = gate·x_new + (1-gate)·x_prev
+ │   │   ④ L+S 分解: LSDecomposition (时序+空间低秩, 通道软阈值)
+ │   │   ⑤ 因果去噪: causal_conv + LayerScale
+ │   └─ DSTLayer:
+ │       ├─ DSTTimeBlock: 多尺度时间卷积 [3,5,7]
+ │       ├─ DeformableSpatialBlock: DeformConv + 膨胀卷积 [d=1,3,7]
+ │       └─ TactileHistoryCompressor
+ │           GAP → MambaSSM → 因果预测 → Kalman 更新 → 查询摘要 → 广播
+ │
+ ├─⑥ 跳跃连接: x += skip_proj(x_tok)
+ │
+ ├─⑦ 不确定性: UncertaintyHead → [B, 8, 1, 224, 224]
+ │
+ └─⑧ 输出: proj_out + trilinear upsample → [B, 8, 3, 224, 224]
+```
+
+---
+
+## 八、模块来源
+
+| 模块 | 来源 | 说明 |
+|------|------|------|
+| MambaSSM | Mamba (arXiv:2312.00752) | 纯 PyTorch 实现 + _scan_direct 短序列修复 |
+| TactileHistoryCompressor | TacMamba (arXiv:2603.01700) | GAP 池化 + 自适应查询 |
+| CausalLatentFilter | CMLF (arXiv:2604.02108) | Sigmoid 门控 + 显式 L/S 输出 |
+| BayesianFusion | CMLF (arXiv:2604.02108) | 2 层 Linear 逆方差加权 |
+| DeformConv2d | DCN (arXiv:1703.06203) | torchvision 调用 |
+| AdaptiveSModule | 原创 | K=4 基矩阵 + meta_net(3维) + importance_net(3层) |
+| LSDecomposition | 原创（红外 STT 启发） | 时空分离 + Schatten-0.5 |
+| CSGradientStep | 原创（PGD Unfolding） | Kalman gain + 门控 + L+S + 因果去噪 |
+| AdaptiveFeatCS | 原创 | adaptive_pool(7×7) + 多基调制 |
+| UncertaintyHead | 原创 | Softplus 方差 + NLL + ECE/Brier |
+| DWT 小波损失 | 原创 | Haar 小波替代 FFT |
+| SSIM 损失 | 原创 | avg_pool 可微实现 |
+| DSTTimeBlock | 原创 | [3,5,7] 多尺度 + Sigmoid 门控 |
+| DeformableSpatialBlock | 原创 | DeformConv + MultiScaleSpatialConv 组合 |
