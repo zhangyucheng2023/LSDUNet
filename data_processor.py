@@ -226,14 +226,37 @@ def data_loader_3d(args, root='./',
                                      min_frames=num_frames,
                                      frame_filter=val_filter)
     else:
-        # 同域划分: 从 train_seqs 中按比例分出验证集 (默认 20%)
+        # 同域划分: 按物体ID分组后随机分出验证集 (默认 20%)
+        # ToucHD/train 命名为 objXXX_speedY, 同一物体的 speed1/speed2 必须
+        # 在同一集合, 否则验证集物体种类不足且分布偏差严重.
         train_seqs = collect_sequences(os.path.join(root, train_dir),
                                        min_frames=num_frames,
                                        frame_filter=train_filter)
         val_split_ratio = getattr(args, 'val_split_ratio', 0.2)
-        all_seq_keys = sorted(train_seqs.keys())
-        n_val = max(1, int(len(all_seq_keys) * val_split_ratio))
-        val_seqs = {k: train_seqs.pop(k) for k in all_seq_keys[:n_val]}
+
+        def _obj_id(seq_key):
+            """obj014_speed1 -> obj014; 其他命名 -> seq_key 本身."""
+            base = os.path.basename(seq_key)
+            return base.split('_speed')[0] if '_speed' in base else base
+
+        # 按物体ID分组序列
+        obj_groups = {}
+        for k in train_seqs.keys():
+            oid = _obj_id(k)
+            obj_groups.setdefault(oid, []).append(k)
+
+        # 固定 seed 随机shuffle物体ID, 保证可复现 + 分布均匀
+        import random
+        rng = random.Random(3407)
+        obj_ids = sorted(obj_groups.keys())
+        rng.shuffle(obj_ids)
+        n_val_objs = max(1, int(len(obj_ids) * val_split_ratio))
+        val_obj_ids = set(obj_ids[:n_val_objs])
+
+        val_seqs = {}
+        for oid in val_obj_ids:
+            for k in obj_groups[oid]:
+                val_seqs[k] = train_seqs.pop(k)
 
     # 限制每序列最大帧数 (防止超大训练集)
     max_frames = getattr(args, 'max_frames_per_seq', 0)

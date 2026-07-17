@@ -51,13 +51,13 @@ KEY_ITER_DATA = 'iter_data'
 KEY_INTERMEDIATES = 'intermediates'
 
 # Dataset paths (single source of truth)
+# 注意: ToucHD 无独立 test 集, 训练用 train, 跨域评估用 touch_and_go.
 DATASET_PATHS = {
-    'toucHD':        './dataset/toucHD/test',
-    'tacquad':       './dataset/TacQuad',
-    'yuan18':        './dataset/PhyTouch',
-    'visgel':        './dataset/visgel',
+    'tacquad':       './dataset/tacquad/train',
+    'yuan18':        './dataset/yuan18/test',
+    'visgel':        './dataset/visgel/images/touch',
     'touch_and_go':  './dataset/touch_and_go',
-    'tacquad_real':  './dataset/TacQuad_real',
+    'tacquad_real':  './dataset/tacquad/test/real/gelsight',
 }
 
 
