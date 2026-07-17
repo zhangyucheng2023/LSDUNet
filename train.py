@@ -348,7 +348,8 @@ if __name__ == '__main__':
     parser.add_argument('--iter_num', type=int, default=6, help='deep unfolding iterations (lite: 4, original: 8)')
     parser.add_argument('--model_dim', type=int, default=64, help='feature dimension (lite: 32, original: 64)')
     parser.add_argument('--train_data', type=str, default='dataset/toucHD/train', help='train dataset path (ToucHD gelsight, 142 seqs)')
-    parser.add_argument('--val_dir', type=str, default='dataset/touch_and_go', help='val dataset path (Touch and Go, 142 seqs)')
+    parser.add_argument('--val_dir', type=str, default='', help='val dataset path (empty=同域 80/20 自动划分)')
+    parser.add_argument('--val_split_ratio', type=float, default=0.2, help='val split ratio when val_dir is empty')
     parser.add_argument('--train_split', type=str, default='', help='frame-level split file for train filtering')
     parser.add_argument('--val_split', type=str, default='', help='frame-level split file for val filtering')
     parser.add_argument('--ratios', type=str, default='0.01,0.10,0.50',

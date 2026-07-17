@@ -156,6 +156,8 @@ torchrun --nproc_per_node=4 train.py --ratios 0.10 --val_interval 5
 | `--warm_epochs` | 5 | 线性 warmup 轮数 |
 | `--wd` | 0.05 | AdamW 权重衰减 |
 | `--grad_clip` | 1.0 | 梯度裁剪 |
+| `--val_dir` | '' | 验证集路径 (空=同域 80/20 自动划分) |
+| `--val_split_ratio` | 0.2 | 同域验证集划分比例 |
 | `--val_interval` | 5 | 验证间隔 (epoch) |
 | `--ls_rank` | 4 | L+S 分解瓶颈维度 |
 | `--ema_decay` | 0.999 | EMA decay (warmup 后) |

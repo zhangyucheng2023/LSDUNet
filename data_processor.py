@@ -218,7 +218,7 @@ def data_loader_3d(args, root='./',
     train_filter = load_tag_frame_split(train_split) if train_split else None
     val_filter = load_tag_frame_split(val_split) if val_split else None
 
-    if val_dir is not None and os.path.isdir(os.path.join(root, val_dir)):
+    if val_dir is not None and val_dir != '' and os.path.isdir(os.path.join(root, val_dir)):
         train_seqs = collect_sequences(os.path.join(root, train_dir),
                                        min_frames=num_frames,
                                        frame_filter=train_filter)
@@ -226,10 +226,14 @@ def data_loader_3d(args, root='./',
                                      min_frames=num_frames,
                                      frame_filter=val_filter)
     else:
+        # 同域划分: 从 train_seqs 中按比例分出验证集 (默认 20%)
         train_seqs = collect_sequences(os.path.join(root, train_dir),
                                        min_frames=num_frames,
                                        frame_filter=train_filter)
-        val_seqs = {}
+        val_split_ratio = getattr(args, 'val_split_ratio', 0.2)
+        all_seq_keys = sorted(train_seqs.keys())
+        n_val = max(1, int(len(all_seq_keys) * val_split_ratio))
+        val_seqs = {k: train_seqs.pop(k) for k in all_seq_keys[:n_val]}
 
     # 限制每序列最大帧数 (防止超大训练集)
     max_frames = getattr(args, 'max_frames_per_seq', 0)
