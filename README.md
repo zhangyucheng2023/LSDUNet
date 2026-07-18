@@ -1,6 +1,6 @@
 # LSDUNet — Learned Spatial-temporal Deep Unfolding Network
 
-基于压缩感知 + 深度展开 + L+S 低秩稀疏分解的轻量化触觉视频重建网络。融合 TacMamba (时序压缩) 与 CMLF (贝叶斯融合 + 因果状态空间滤波)，2.640M 参数，支持 4×4090 DDP 训练。
+基于压缩感知 + 深度展开 + L+S 低秩稀疏分解的轻量化触觉视频重建网络。融合 TacMamba (时序压缩) 与 CMLF (贝叶斯融合 + 因果状态空间滤波)，2.640M 参数，支持 4×5090 DDP 训练。
 
 ## 项目结构
 
@@ -13,7 +13,7 @@ LSDUNet/
 ├── eval.py                       # 统一评估入口 (--mode standard|cross-domain|noise|interpret)
 ├── metrics.py                    # 评估指标 (含ECE/Brier校准)
 ├── utils.py                      # 工具函数
-├── run_4x4090.sh                 # 4×4090 DDP启动脚本
+├── run_4x5090.sh                 # 4×5090 DDP启动脚本 (BATCH/GRAD_ACCUM 环境变量可覆盖)
 ├── requirements.txt
 └── LICENSE
 ```
@@ -201,6 +201,16 @@ python eval.py --mode interpret --submode all --ckpt trained_model/lsdunet_0.10.
 ```bash
 pip install -r requirements.txt
 ```
+
+### 数据集软链接
+
+训练脚本默认从 `dataset/` 目录读取数据。clone 后请创建软链接指向本地数据集根目录（包含 `toucHD/train/`、`touch_and_go/` 等子目录）：
+
+```bash
+ln -s /path/to/your/dataset dataset
+```
+
+若未创建软链接，训练启动时会因找不到数据集而失败。
 
 ## 依赖
 

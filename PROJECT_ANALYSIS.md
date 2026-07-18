@@ -24,8 +24,7 @@ LSDUNet/
 ├── eval_touchd.py         # LSDU-COMP 统一对比框架适配
 ├── metrics.py             # 评估指标（PSNR/SSIM/LPIPS/ECE/Brier）
 ├── utils.py               # 工具函数
-├── run_2x4090.sh          # 2×4090 DDP 启动脚本
-├── run_4x4090.sh          # 4×4090 DDP 启动脚本
+├── run_4x5090.sh          # 4×5090 DDP 启动脚本 (BATCH/GRAD_ACCUM 环境变量可覆盖)
 └── requirements.txt
 ```
 

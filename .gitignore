@@ -2,7 +2,7 @@ __pycache__/
 *.pyc
 *.pth
 trained_model/
-dataset/
+/dataset                # 软链接, 用户需自行创建指向数据集根目录 (见 README)
 .DS_Store
 *Zone.Identifier
 *.log
