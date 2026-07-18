@@ -314,19 +314,29 @@ def train_3d(train_loader, model, optimizer, device, grad_clip=1.0,
                 if Ls:  # 训练时才有缓存
                     loss_lowrank = 0.0
                     for L in Ls:
-                        # L: [B, C, T, H, W] → 池化 [B, C, T, 4, 4] → [B, T, C*16]
-                        B_l, C_l, T_l, H_l, W_l = L.shape
-                        L_pool = F.adaptive_avg_pool3d(L, (T_l, 4, 4))
-                        L_mat = L_pool.reshape(B_l, T_l, -1)  # [B, T, C*16]
+                        # 双重 L+S 形状不一致, 按维度分支:
+                        #   ① 显式 LSDecomposition: [B, C, T, H, W] (5D)
+                        #   ② 隐式 Kalman L/S:      [B, T, C]      (3D, 已是序列级矩阵)
+                        if L.dim() == 5:
+                            B_l, _, T_l, _, _ = L.shape
+                            # 池化 [B, C, T, 4, 4] → [B, T, C*16]
+                            L_pool = F.adaptive_avg_pool3d(L, (T_l, 4, 4))
+                            L_mat = L_pool.reshape(B_l, T_l, -1)
+                        else:
+                            # Kalman 隐式 L: [B, T, C] 直接当作矩阵做 SVD
+                            L_mat = L
+                            B_l = L.shape[0]
                         # svdvals: 只算奇异值, 比 svd 更快更稳定 (无需 U/V)
                         # clamp 防止 σ→0 时 σ^0.5 梯度爆炸 (0.5/√σ→∞)
+                        # L/S 已 detach, 用 FP32 计算 SVD (BF16 svdvals 不支持)
                         try:
-                            S_sval = torch.linalg.svdvals(L_mat)
+                            S_sval = torch.linalg.svdvals(L_mat.float())
                             loss_lowrank = loss_lowrank + S_sval.clamp(min=1e-6).pow(0.5).sum() / B_l
                         except RuntimeError:
                             # SVD 不收敛时退回 Frobenius (数值安全)
-                            loss_lowrank = loss_lowrank + L.pow(2).mean()
+                            loss_lowrank = loss_lowrank + L.float().pow(2).mean()
                     loss_lowrank = loss_lowrank / len(Ls)
+                    # S 稀疏项: abs().mean() 对任意维度都成立, 无需分支
                     loss_sparse = sum(S.abs().mean() for S in Ss) / len(Ss)
                     loss = loss + aux_scale * (w_lowrank * loss_lowrank + w_sparse * loss_sparse)
 

@@ -58,19 +58,23 @@ def main(cs_ratio):
                      in_ch=3, ls_rank=args.ls_rank,
                      num_frames=args.num_frames).to(device)
 
+    # Enable gradient checkpointing to save VRAM (recompute activations in backward)
+    model._use_ckpt = True
+    if is_main:
+        print(f"[ckpt] gradient checkpointing enabled (_use_ckpt={model._use_ckpt})")
+
     # cuDNN benchmark: 自动选择最优卷积算法 (固定输入尺寸下加速 5-10%)
     torch.backends.cudnn.benchmark = True
 
-    # torch.compile: 算子融合加速 (bf16 下 10-30%)
-    # mode='reduce-overhead' 优化 CPU 开销, 适合 DDP
-    if not args.debug and hasattr(torch, 'compile'):
-        try:
-            model = torch.compile(model, mode='reduce-overhead')
-            if is_main:
-                print("[compile] torch.compile enabled (reduce-overhead)")
-        except Exception as e:
-            if is_main:
-                print(f"[compile] torch.compile failed, fallback: {e}")
+    # torch.compile: disabled — model has dynamic control flow incompatible with Dynamo
+    # if not args.debug and hasattr(torch, 'compile'):
+    #     try:
+    #         model = torch.compile(model, mode='reduce-overhead')
+    #         if is_main:
+    #             print("[compile] torch.compile enabled (reduce-overhead)")
+    #     except Exception as e:
+    #         if is_main:
+    #             print(f"[compile] torch.compile failed, fallback: {e}")
 
     # Resume from checkpoint
     start_epoch = 1

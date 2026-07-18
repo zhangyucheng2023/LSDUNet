@@ -629,8 +629,11 @@ class TactileHistoryCompressor(nn.Module):
         #   L_kalman = compressed (平滑状态 → 低秩, 对应稳定接触背景)
         #   S_kalman = observed - predicted (innovation → 稀疏, 对应突变的滑动/碰撞)
         if self.training:
-            self.last_L_kalman = compressed  # [B, T, C]
-            self.last_S_kalman = observed - predicted  # [B, T, C]
+            # detach: 避免 L/S 缓存持有 forward 计算图引用导致 gradient
+            # checkpointing 失效 (会保留所有中间激活). L+S 正则化只作为
+            # 监控信号 (w_lowrank/w_sparse=0.01 辅助正则), 不参与反传.
+            self.last_L_kalman = compressed.detach()  # [B, T, C]
+            self.last_S_kalman = (observed - predicted).detach()  # [B, T, C]
 
         # Adaptive query weighting (per-sample, input-dependent)
         q_weights = self.query_gate(x_norm)  # [B, num_queries]
@@ -755,8 +758,12 @@ class LSDecomposition(nn.Module):
         S = torch.sign(S) * torch.clamp(torch.abs(S) - self.tau, min=0)
         # 缓存 L/S 供 Schatten-p 正则化损失使用
         if self.training:
-            self.last_L = L
-            self.last_S = S
+            # 关键优化: 池化后缓存, 避免保留完整 5D 特征图 (~412MB/张).
+            # 完整 [B,C,T,H,W] 池化到 [B,C,T,4,4] 后做 svdvals, 结果完全等价
+            # (trainer.py 后续也是这样池化的). 缓存体积减少 760x (~540KB).
+            T_l = L.shape[2]
+            self.last_L = F.adaptive_avg_pool3d(L.detach(), (T_l, 4, 4))
+            self.last_S = F.adaptive_avg_pool3d(S.detach(), (S.shape[2], 4, 4))
         return L + S
 
 
@@ -1040,10 +1047,12 @@ class LSDUNet(nn.Module):
         mech_data = {} if return_mechanism else None
 
         x_prev = None
-        # 训练时关闭梯度 checkpointing: 模型仅 2.64M 参数, 4090 显存充足,
-        # 关闭后省 30% 重算开销, 效果完全相同.
-        # eval 时无梯度, 直接前向.
-        use_ckpt = self.training and x.requires_grad and getattr(self, '_use_ckpt', False)
+        # Gradient checkpointing: forward 不存中间激活, backward 时重算.
+        # 注意: 条件不能检查 x.requires_grad (输入图像通常不需要梯度),
+        # 否则训练时永远不启用 → 中间激活全部保留 → OOM.
+        # 正确判断: training 模式 + _use_ckpt 标志 + 至少一个参数需要梯度.
+        use_ckpt = (self.training and getattr(self, '_use_ckpt', False)
+                    and any(p.requires_grad for p in self.parameters()))
         for i in range(self.iter_num):
             if use_ckpt:
                 if return_mechanism:
