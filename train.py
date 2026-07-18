@@ -248,6 +248,7 @@ def main(cs_ratio):
                     best_val_psnr = val_psnr
                     if is_main:
                         model_to_save = model.module if dist.is_initialized() else model
+                        os.makedirs(model_dir, exist_ok=True)  # 防御性, 防止训练中目录被删
                         torch.save(model_to_save.state_dict(), "%s/best.pth" % model_dir)
                         torch.save(model_to_save.state_dict(), "./trained_model/%s" % ck_file_name)
                         print("  >> Best model saved (PSNR: %.2f)" % val_psnr)
@@ -273,6 +274,8 @@ def main(cs_ratio):
                     'main_scheduler_state_dict': main_scheduler.state_dict(),
                     'best_val_psnr': best_val_psnr,
                 }
+                # 防御性 makedirs: 防止训练运行中 model_dir 被外部删除导致 checkpoint 保存失败
+                os.makedirs(model_dir, exist_ok=True)
                 torch.save(checkpoint, os.path.join(model_dir, 'checkpoint.pth'))
 
             # LayerScale weights
